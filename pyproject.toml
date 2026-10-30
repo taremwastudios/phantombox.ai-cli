@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "phantombox"
+version = "0.1.0"
+description = "Local-first offline AI runtime (phantombox.ai)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Taremwa Andrew" }]
+dependencies = [
+    "typer[all]>=0.12.0",
+    "rich>=13.0.0",
+    "httpx>=0.27.0",
+    "huggingface-hub>=0.23.0",
+    "platformdirs>=4.0.0",
+]
+
+[project.scripts]
+phantombox = "phantombox.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/phantombox"]
