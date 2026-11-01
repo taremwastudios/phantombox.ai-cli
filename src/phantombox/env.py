@@ -47,6 +47,21 @@ def get_llama_dir() -> Path:
     return path
 
 
+def get_workspace_dir() -> Path:
+    """Return the designated workspace directory for AI execution and user files.
+    
+    This directory ('phantombox-dir') is kept strictly outside the tool/CLI source folder.
+    It is placed in the user's home or desktop so users can drop files into it or let AI create them.
+    """
+    desktop = Path.home() / "Desktop"
+    if desktop.exists() and desktop.is_dir():
+        ws = desktop / "phantombox-dir"
+    else:
+        ws = Path.home() / "phantombox-dir"
+    ws.mkdir(parents=True, exist_ok=True)
+    return ws
+
+
 # ----------------------------------------------------------------------
 # Detection helpers
 # ----------------------------------------------------------------------
@@ -153,9 +168,10 @@ def print_environment_status() -> dict:
     console.print()
 
     # Show paths
-    console.print(f"[bold]Data directory:[/bold]  {get_data_dir()}")
-    console.print(f"[bold]Models directory:[/bold] {get_models_dir()}")
-    console.print(f"[bold]llama.cpp dir:[/bold]   {get_llama_dir()}")
+    console.print(f"[bold]Data directory:[/bold]      {get_data_dir()}")
+    console.print(f"[bold]Models directory:[/bold]    {get_models_dir()}")
+    console.print(f"[bold]llama.cpp dir:[/bold]       {get_llama_dir()}")
+    console.print(f"[bold]AI Workspace dir:[/bold]    {get_workspace_dir()}")
     console.print()
 
     return {

@@ -77,10 +77,10 @@ def pull(
 
 @app.command()
 def chat(
-    model: str = typer.Argument(..., help="Model name (e.g. qwen2.5-0.5b)"),
+    model: str = typer.Argument(None, help="Optional model name to connect or start"),
 ):
     """
-    Chat with a local model.
+    Open the phantombox chat interface.
     """
     from phantombox.chat import run_chat
     run_chat(model)
@@ -129,6 +129,81 @@ def stop(
     success = stop_model(model)
     if not success:
         raise typer.Exit(code=1)
+
+
+server_app = typer.Typer(help="Manage PhantomBox LAN AI server, auth, and discovery")
+app.add_typer(server_app, name="server")
+
+
+@server_app.command("start")
+def cli_server_start(
+    port: int = typer.Option(8443, "--port", "-p", help="Port to run server on"),
+):
+    """Start the PhantomBox LAN AI server."""
+    from phantombox.server import start_server, get_local_ip
+    success, msg = start_server(port=port)
+    if success:
+        console.print(f"[bold green]✓[/bold green] {msg}")
+    else:
+        console.print(f"[bold red]✗[/bold red] {msg}")
+        raise typer.Exit(code=1)
+
+
+@server_app.command("close")
+def cli_server_close():
+    """Close and stop the PhantomBox LAN server."""
+    from phantombox.server import stop_server
+    success, msg = stop_server()
+    if success:
+        console.print(f"[bold green]✓[/bold green] {msg}")
+    else:
+        console.print(f"[bold yellow]![/bold yellow] {msg}")
+
+
+@server_app.command("user")
+def cli_server_user(
+    username: str = typer.Argument(..., help="Username"),
+    password: str = typer.Argument(..., help="Password"),
+    privilege: str = typer.Option("regular", "--privilege", "-r", help="Privilege level: all | regular | use-only"),
+):
+    """Create or update a server user with privilege."""
+    from phantombox.server import set_user
+    if privilege not in ("all", "regular", "use-only"):
+        console.print(f"[bold red]Invalid privilege:[/bold red] {privilege}. Must be 'all', 'regular', or 'use-only'.")
+        raise typer.Exit(code=1)
+    set_user(username, password, privilege)
+    console.print(f"[bold green]✓[/bold green] User '[bold]{username}[/bold]' configured with privilege '[bold cyan]{privilege}[/bold cyan]'.")
+
+
+@server_app.command("users")
+def cli_server_users():
+    """List configured server users."""
+    from phantombox.server import list_users
+    users = list_users()
+    console.print(f"\n[bold cyan]Configured PhantomBox Server Users ({len(users)}):[/bold cyan]")
+    if not users:
+        console.print("  [dim]No users configured. Use: phantombox server user <name> <password> --privilege all[/dim]\n")
+        return
+    for u, priv in users.items():
+        color = "red" if priv == "all" else ("yellow" if priv == "regular" else "blue")
+        console.print(f"  • [bold]{u}[/bold]: [{color}]{priv}[/{color}]")
+    console.print()
+
+
+@server_app.command("status")
+def cli_server_status():
+    """Check PhantomBox server status and IP."""
+    from phantombox.server import is_server_running, get_server_config, get_local_ip, list_users
+    running = is_server_running()
+    cfg = get_server_config()
+    ip = get_local_ip()
+    port = cfg.get("port", 8443)
+    disc = cfg.get("discoverable", True)
+    console.print(f"\n[bold cyan]PhantomBox Server Status:[/bold cyan]")
+    console.print(f"  • Status: {'[bold green]ONLINE[/bold green]' if running else '[bold yellow]OFFLINE[/bold yellow]'}")
+    console.print(f"  • Local IP: [bold]{ip}[/bold] (Port: {port})")
+    console.print(f"  • Discoverable: {'[green]YES[/green]' if disc else '[red]NO[/red]'}")
+    console.print(f"  • Registered Users: {len(list_users())}\n")
 
 
 if __name__ == "__main__":
