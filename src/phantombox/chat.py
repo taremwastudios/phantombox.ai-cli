@@ -3029,6 +3029,7 @@ class PhantomChat(App):
             get_local_ip,
             get_server_config,
             discover_lan_servers,
+            get_cloud_info,
             save_remote_server,
             list_remote_servers,
             remove_remote_server,
@@ -3088,20 +3089,35 @@ class PhantomChat(App):
 
         subcmd = args[0].lower()
 
-        # 1. /server start [port]
+        # 1. /server start [--public-ip X.X.X.X] [--bind Y.Y.Y.Y] [port]
         if subcmd == "start":
             port = None
-            if len(args) > 1 and args[1].isdigit():
-                port = int(args[1])
-            success, msg = start_server(port=port)
+            public_ip = ""
+            bind_host = ""
+            for i in range(1, len(args)):
+                if args[i] == "--public-ip" and i + 1 < len(args):
+                    public_ip = args[i + 1]
+                    i += 1
+                elif args[i] == "--bind" and i + 1 < len(args):
+                    bind_host = args[i + 1]
+                    i += 1
+                elif args[i].isdigit():
+                    port = int(args[i])
+            success, msg = start_server(port=port, public_ip=public_ip, host=bind_host)
             if success:
                 cfg = get_server_config()
                 p = cfg.get("port", 8443)
-                ip = get_local_ip()
+                cloud = get_cloud_info()
+                ip = cloud.get("public_ip") or get_local_ip()
+                note = (
+                    "\n[dim]VPS/cloud server: devices on this WiFi/Hotspot AND over the internet can reach this address "
+                    "(firewall/security group permitting).[/dim]"
+                    if cloud.get("is_cloud") else ""
+                )
                 await self._add_system_message(
                     f"[bold green]Server started successfully![/bold green]\n"
                     f"Address: [bold cyan]http://{ip}:{p}[/bold cyan]\n"
-                    f"Devices on this WiFi/Hotspot can now connect and sign in."
+                    f"Devices on this WiFi/Hotspot can now connect and sign in.{note}"
                 )
             else:
                 await self._add_system_message(f"[bold red]Failed to start server:[/bold red] {msg}")
@@ -3317,8 +3333,10 @@ class PhantomChat(App):
 
         if not found:
             await self._add_system_message(
-                "[bold red]The preferred network is either not open or the entered IP is unreachable, please try again later[/bold red]"
+                "[bold red]The preferred network is either not open or the entered IP is unreachable, please try again later[/bold red]\n"
+                "[dim]Note: VPS/cloud servers are reachable over the internet by ip:port, not by LAN scan — use the manual address below.[/dim]"
             )
+            await self._run_server_connect_flow("")
             return
 
         lines = [f"[bold green]Found {len(found)} PhantomBox server(s) on this network:[/bold green]"]
@@ -3366,8 +3384,14 @@ class PhantomChat(App):
         # Connection is open: show the connect menu
         signup_mode = info.get("signup_mode", "open")
         device_type = info.get("device_type", "unknown")
+        is_cloud = info.get("is_cloud", False)
+        cloud_note = (
+            "\n[bold yellow]VPS/cloud server[/bold yellow] — this box is reachable over the internet by its public ip:port, not just on LAN."
+            if is_cloud else ""
+        )
         await self._add_system_message(
-            f"[bold green]Connected to[/bold green] [bold]{info.get('name', host)}[/bold] [dim]({device_type}, signup: {signup_mode})[/dim]\n"
+            f"[bold green]Connected to[/bold green] [bold]{info.get('name', host)}[/bold] [dim]({device_type}, signup: {signup_mode})[/dim]"
+            f"{cloud_note}\n"
             f"Host: [cyan]{info.get('ip', host)}:{info.get('port', port)}[/cyan]\n\n"
             "[bold]Options:[/bold]\n"
             "  1. Sign In\n"

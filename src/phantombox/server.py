@@ -280,6 +280,190 @@ def detect_device_type() -> str:
     return "desktop" if system in ("Windows", "Darwin") else "unknown"
 
 
+# ---------------------------------------------------------------------------
+# Cloud / VPS detection — extends the device-type classification with the
+# provider flavor and the PUBLIC IPv4 so VPS installs can advertise an
+# internet-reachable URL (LAN-only devices never need this).
+# ---------------------------------------------------------------------------
+
+_CLOUD_PROVIDERS = ("aws", "gcp", "azure", "oci", "digitalocean", "linode",
+                    "hetzner", "ovh", "vultr", "oracle", "alibaba", "scaleway", "other")
+
+# Metadata endpoints per provider (link-local 169.254.169.254 — only reachable
+# from inside the cloud host itself, which is exactly what we want).
+_METADATA_ENDPOINTS = (
+    ("http://169.254.169.254/latest/meta-data/public-ipv4", "aws"),
+    ("http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip", "gcp"),
+    ("http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress?api-version=2017-08-01&format=text", "azure"),
+    ("http://169.254.169.254/opc/v1/vnics/", "oci"),
+    ("http://169.254.169.254/metadata/v1.json", "digitalocean"),
+    ("http://169.254.169.254/v1/interfaces/", "linode"),
+    ("http://169.254.169.254/hetzner/v1/metadata/hostname", "hetzner"),
+    ("http://169.254.169.254/1.0/meta-data/instance-id", "ovh"),
+    ("http://169.254.169.254/meta-data/instance-id", "vultr"),
+)
+
+def detect_cloud_provider() -> str:
+    """Return the cloud provider flavor: aws|gcp|azure|oci|digitalocean|linode|hetzner|ovh|vultr|oracle|alibaba|scaleway|other — or '' when not a cloud host."""
+    import platform
+
+    # 1. DMI vendor/product strings (works offline, instant)
+    markers = {
+        "aws": ("amazon", "ec2"),
+        "gcp": ("google", "gce"),
+        "azure": ("microsoft corporation", "hyper-v"),
+        "oci": ("oracle"),
+        "digitalocean": ("digitalocean", "droplet"),
+        "linode": ("linode"),
+        "hetzner": ("hetzner"),
+        "ovh": ("ovh"),
+        "vultr": ("vultr", "an3", "vultrguest"),
+        "alibaba": ("alibaba", "aliyun"),
+        "scaleway": ("scaleway"),
+    }
+    blob_parts = []
+    for path in ("/sys/class/dmi/id/sys_vendor", "/sys/class/dmi/id/product_name",
+                 "/sys/hypervisor/type"):
+        try:
+            with open(path, "r", errors="ignore") as fh:
+                blob_parts.append(fh.read(512).strip().lower())
+        except Exception:
+            blob_parts.append("")
+    blob = " ".join(blob_parts)
+    if "hypervisor" in open("/proc/cpuinfo", errors="ignore").read().lower() if os.path.exists("/proc/cpuinfo") else False:
+        blob += " hypervisor"
+    for provider, keys in markers.items():
+        if any(k in blob for k in keys):
+            return provider
+
+    # 2. Metadata server probe (authoritative when DMI is inconclusive).
+    # NOTE: gethostbyname on a literal IP always "succeeds", so we must
+    # actually try a TCP connect to the metadata port — a link-local address
+    # that isn't a real metadata server will refuse/timeout immediately.
+    import socket
+    from urllib.parse import urlparse
+    for url, provider in _METADATA_ENDPOINTS:
+        try:
+            parsed = urlparse(url)
+            host = parsed.hostname
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1.0)
+            sock.connect((host, port))
+            sock.close()
+            return provider
+        except Exception:
+            continue
+    return ""
+
+
+def get_public_ip(timeout: float = 2.0) -> str:
+    """Best-effort public IPv4 for cloud/VPS hosts.
+
+    Order: provider metadata endpoints (most authoritative) -> cloud DMI
+    metadata (same as above, via the socket probe) -> STUN (works on any host
+    with internet egress) -> empty string when nothing works.
+    Never raises.
+    """
+    import httpx
+
+    # 1. Metadata endpoints — return the IP directly from the provider
+    for url, provider in _METADATA_ENDPOINTS:
+        try:
+            r = httpx.get(url, timeout=timeout, headers={"Metadata-Flavor": "Google"})
+            if r.status_code == 200:
+                text = (r.text or "").strip()
+                if text and not text.startswith("<") and len(text) < 64:
+                    # Azure/DigitalOcean return JSON sometimes — extract ipv4
+                    if text.startswith("{"):
+                        try:
+                            obj = json.loads(text)
+                            text = str(obj.get("public-ipv4") or obj.get("ipAddress") or obj.get("v4", {}).get("ipAddress") or "")
+                        except Exception:
+                            pass
+                    if _looks_like_ipv4(text):
+                        return text
+        except Exception:
+            continue
+
+    # 2. STUN fallback — ask a public STUN server what address we appear from
+    stun = _stun_public_ip(timeout)
+    if stun:
+        return stun
+    return ""
+
+
+def _looks_like_ipv4(s: str) -> bool:
+    parts = s.strip().split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        return all(0 <= int(p) <= 255 for p in parts)
+    except Exception:
+        return False
+
+
+def _stun_public_ip(timeout: float) -> str:
+    """RFC 5389 STUN binding request over UDP to discover the public IPv4."""
+    import socket
+    import struct
+
+    servers = (("stun.l.google.com", 19302), ("stun1.l.google.com", 19302),
+               ("stun.cloudflare.com", 3478))
+    for host, port in servers:
+        try:
+            addr = (socket.gethostbyname(host), port)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(timeout)
+            # STUN Binding Request: type=0x0001, length=0, magic cookie, xact id
+            msg = struct.pack("!HHI", 0x0001, 0, 0x2112A442) + secrets.token_bytes(12)
+            sock.sendto(msg, addr)
+            data, _ = sock.recvfrom(1024)
+            sock.close()
+            if len(data) < 20:
+                continue
+            msg_type, msg_len, cookie = struct.unpack("!HHI", data[:8])
+            if msg_type != 0x0101:  # Binding Success Response
+                continue
+            # Walk TLV attributes to find MAPPED-ADDRESS (0x0001)
+            idx = 20
+            while idx + 4 <= len(data):
+                attr_type, attr_len = struct.unpack("!HH", data[idx:idx + 4])
+                if attr_type == 0x0001 and attr_len >= 8:
+                    port_field, ip_bytes = struct.unpack("!H4s", data[idx + 4:idx + 12])
+                    ip = ".".join(str(b) for b in ip_bytes)
+                    if _looks_like_ipv4(ip):
+                        return ip
+                idx += 4 + attr_len + (4 - attr_len % 4) % 4
+        except Exception:
+            continue
+    return ""
+
+
+def get_cloud_info() -> Dict[str, Any]:
+    """Bundle cloud classification for /v1/info and the UDP beacon.
+
+    Returns {"is_cloud": bool, "cloud": str-or-empty, "public_ip": str-or-empty}.
+    Cached per process: DMI strings never change at runtime, and probing the
+    metadata server / STUN on every beacon reply would add latency.
+    """
+    global _CLOUD_INFO_CACHE
+    if _CLOUD_INFO_CACHE is None:
+        provider = detect_cloud_provider()
+        is_cloud = bool(provider)
+        public_ip = get_public_ip() if is_cloud else ""
+        _CLOUD_INFO_CACHE = {
+            "is_cloud": is_cloud,
+            "cloud": provider,
+            "public_ip": public_ip,
+        }
+    return _CLOUD_INFO_CACHE
+
+
+# Filled by get_cloud_info() on first call; reset in tests via _CLOUD_INFO_CACHE = None
+_CLOUD_INFO_CACHE: Optional[Dict[str, Any]] = None
+
+
 # =============================================================================
 # Server Configuration and User Management
 # =============================================================================
@@ -606,18 +790,27 @@ class PhantomBoxServerHandler(BaseHTTPRequestHandler):
         # Public info endpoint for mobile discovery
         if path == "/v1/info":
             server_cfg = get_server_config()
+            cloud_info = get_cloud_info()
+            device_type = detect_device_type()
+            is_cloud = cloud_info.get("is_cloud", False) and device_type in ("vm", "server")
+            public_ip = (cloud_info.get("public_ip", "") or server_cfg.get("public_ip", "")) if is_cloud else ""
+            # VPS/cloud: advertise the internet-reachable address; LAN: the LAN IP
+            advertised_ip = public_ip if (is_cloud and public_ip) else get_local_ip()
             self._send_json(200, {
                 "name": socket.gethostname(),
                 "app": "phantombox",
                 "version": "0.2.0",
-                "ip": get_local_ip(),
+                "ip": advertised_ip,
                 "port": server_cfg.get("port", 8443),
-                "device_type": detect_device_type(),
+                "device_type": device_type,
                 "auth_required": True,
                 "has_users": bool(server_cfg.get("users")),
                 "discoverable": server_cfg.get("discoverable", True),
                 "signup_mode": server_cfg.get("auth_mode", AUTH_MODE_OPEN),
                 "open": server_cfg.get("auth_mode", AUTH_MODE_OPEN) == AUTH_MODE_OPEN,
+                "is_cloud": is_cloud,
+                "cloud": cloud_info.get("cloud", "") if is_cloud else "",
+                "public_ip": public_ip,
             })
             return
 
@@ -1020,16 +1213,34 @@ def _discovery_responder(stop_event: threading.Event) -> None:
 
                 server_port = cfg.get("port", 8443)
                 device_ip = get_local_ip()
+                cloud_info = get_cloud_info()
+                device_type = detect_device_type()
+                # VPS/cloud hosts are reachable over the INTERNET by public
+                # ip:port — advertise the public URL, never the LAN/loopback
+                # address (which remote users can't reach).
+                is_cloud = cloud_info.get("is_cloud", False) and device_type in ("vm", "server")
+                public_ip = cloud_info.get("public_ip", "") or ("" if is_cloud else "")
+                if is_cloud and public_ip:
+                    device_ip = public_ip
+                elif is_cloud and not public_ip:
+                    # Public IP unknown — keep the LAN address for LAN users,
+                    # remote users must use the provider-assigned IP. The beacon
+                    # reply flags this so clients can prompt for manual input.
+                    public_ip = device_ip
+                advertised_ip = public_ip if is_cloud and public_ip else device_ip
                 response = {
                     "magic": DISCOVERY_MAGIC_REPLY,
                     "server_name": socket.gethostname(),
                     "app": "phantombox",
                     "version": "0.2.0",
-                    "device_type": detect_device_type(),
-                    "ip": device_ip,
+                    "device_type": device_type,
+                    "ip": advertised_ip,
                     "port": server_port,
                     "signup_mode": get_server_config().get("auth_mode", AUTH_MODE_OPEN),
-                    "url": f"http://{device_ip}:{server_port}",
+                    "url": f"http://{advertised_ip}:{server_port}",
+                    "is_cloud": is_cloud,
+                    "cloud": cloud_info.get("cloud", "") if is_cloud else "",
+                    "public_ip": public_ip if is_cloud else "",
                 }
                 sock.sendto(json.dumps(response).encode("utf-8"), addr)
         except socket.timeout:
@@ -1076,8 +1287,15 @@ def discover_lan_servers(timeout_seconds: float = 2.0) -> List[Dict[str, Any]]:
 # Lifecycle Management (start, stop, status)
 # =============================================================================
 
-def start_server(port: Optional[int] = None, host: str = "0.0.0.0") -> Tuple[bool, str]:
-    """Start the PhantomBox LAN AI HTTP server and discovery beacon in background threads."""
+def start_server(port: Optional[int] = None, host: str = "0.0.0.0", public_ip: str = "") -> Tuple[bool, str]:
+    """Start the PhantomBox HTTP server and discovery beacon in background threads.
+
+    VPS/cloud handling: when the box is detected as a VPS (device_type vm or
+    a cloud-classified server) AND the caller did not force an explicit bind
+    host, the server binds ALL interfaces (0.0.0.0) — loopback-only would make
+    it unreachable to remote users over the internet. The beacon advertises
+    the PUBLIC ip:port (metadata/STUN detected), never 127.0.0.1.
+    """
     global _SERVER_INSTANCE, _SERVER_THREAD, _DISCOVERY_THREAD, _DISCOVERY_STOP_EVENT
 
     if _SERVER_INSTANCE is not None:
@@ -1085,15 +1303,25 @@ def start_server(port: Optional[int] = None, host: str = "0.0.0.0") -> Tuple[boo
         return True, f"Server already running at http://{get_local_ip()}:{cfg.get('port', 8443)}"
 
     server_cfg = get_server_config()
+    device_type = detect_device_type()
+    cloud_info = get_cloud_info()
+    is_cloud = cloud_info.get("is_cloud", False) and device_type in ("vm", "server")
+
+    # --- VPS auto-bind: all interfaces unless the user forced loopback -------
+    if is_cloud and host not in ("127.0.0.1", "localhost", "::1"):
+        bind_host = "0.0.0.0"
+    else:
+        bind_host = host
+
     target_port = port or server_cfg.get("port", 8443)
     server_cfg["port"] = target_port
-    server_cfg["host"] = host
+    server_cfg["host"] = bind_host
     save_server_config(server_cfg)
 
     try:
-        _SERVER_INSTANCE = ThreadingHTTPServer((host, target_port), PhantomBoxServerHandler)
+        _SERVER_INSTANCE = ThreadingHTTPServer((bind_host, target_port), PhantomBoxServerHandler)
     except Exception as e:
-        return False, f"Failed to bind server to {host}:{target_port}: {e}"
+        return False, f"Failed to bind server to {bind_host}:{target_port}: {e}"
 
     _SERVER_THREAD = threading.Thread(target=_SERVER_INSTANCE.serve_forever, daemon=True, name="PhantomBoxServerThread")
     _SERVER_THREAD.start()
@@ -1101,6 +1329,48 @@ def start_server(port: Optional[int] = None, host: str = "0.0.0.0") -> Tuple[boo
     _DISCOVERY_STOP_EVENT.clear()
     _DISCOVERY_THREAD = threading.Thread(target=_discovery_responder, args=(_DISCOVERY_STOP_EVENT,), daemon=True, name="PhantomBoxDiscoveryThread")
     _DISCOVERY_THREAD.start()
+
+    # --- VPS detection result + interactive instructions ---------------------
+    if is_cloud:
+        provider = cloud_info.get("cloud", "other") or "other"
+        detected_public = cloud_info.get("public_ip", "") or ("" if is_cloud else "")
+        if detected_public:
+            public_ip = detected_public
+        if public_ip:
+            server_cfg["public_ip"] = public_ip
+            save_server_config(server_cfg)
+
+        instructions = (
+            "\n\u250c\u2500 VPS detected " + "\u2500" * 48 + "\n"
+            "\u2502 This box is a VPS/cloud device (device_type: " + device_type +
+            ", provider: " + provider + ").\n"
+            "\u2502 The server binds ALL interfaces (" + bind_host + ":" + str(target_port) + ") and advertises:\n"
+            "\u2502   http://" + (public_ip or "<public-ip>") + ":" + str(target_port) + "\n"
+            "\u2502\n"
+            "\u2502 1. Open the port in your provider's firewall/security group:\n"
+            "\u2502      EC2 security group, GCE firewall rule, Azure NSG, ...\n"
+            "\u2502    Allow TCP " + str(target_port) + " from 0.0.0.0/0.\n"
+            "\u2502 2. OS-level firewall (if enabled):\n"
+            "\u2502      ufw allow " + str(target_port) + "/tcp\n"
+            "\u2502      iptables -A INPUT -p tcp --dport " + str(target_port) + " -j ACCEPT\n"
+            "\u2502 3. Keep it running after SSH disconnect:\n"
+            "\u2502      nohup python -m phantombox.server &\n"
+            "\u2502 4. Recommended for internet exposure: reverse proxy + TLS\n"
+            "\u2502    (nginx + certbot on 443 \u2192 " + str(target_port) + "). Then start with:\n"
+            "\u2502      /server start --bind 127.0.0.1\n"
+            "\u2502\n"
+            "\u2502 Your server will be reachable at http://" + (public_ip or "<public-ip>") + ":" + str(target_port) + "\n"
+            "\u2502 once the provider's firewall allows TCP " + str(target_port) + ".\n"
+            "\u2514" + "\u2500" * 48 + "\n"
+        )
+        if not detected_public:
+            instructions += (
+                "\u2502 NOTE: could not auto-detect your public IPv4.\n"
+                "\u2502 Check your provider console (EC2 public IPv4, Hetzner IPv4, ...) and\n"
+                "\u2502 restart with: /server start --public-ip <ip>\n"
+                "\u2514" + "\u2500" * 48 + "\n"
+            )
+        return True, instructions
 
     local_ip = get_local_ip()
     msg = f"PhantomBox server started on http://{local_ip}:{target_port} (LAN/Hotspot accessible)"
