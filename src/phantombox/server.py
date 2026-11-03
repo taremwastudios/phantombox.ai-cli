@@ -386,7 +386,19 @@ def get_public_ip(timeout: float = 2.0) -> str:
         except Exception:
             continue
 
-    # 2. STUN fallback — ask a public STUN server what address we appear from
+    # 2. HTTPS echo fallback — works from almost any VPS (metadata probes and
+    #    STUN/UDP egress are often blocked by provider firewalls, but TCP 443
+    #    outbound essentially never is).
+    for echo in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://checkip.amazonaws.com"):
+        try:
+            r = httpx.get(echo, timeout=timeout, headers={"User-Agent": "phantombox"})
+            text = (r.text or "").strip()
+            if text and _looks_like_ipv4(text):
+                return text
+        except Exception:
+            continue
+
+    # 3. STUN fallback (last resort; some providers block UDP egress)
     stun = _stun_public_ip(timeout)
     if stun:
         return stun

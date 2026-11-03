@@ -3074,6 +3074,7 @@ class PhantomChat(App):
                 "  • [cyan]/server start [port][/cyan] - Open server for network connections",
                 "  • [cyan]/server close[/cyan] - Close and shutdown server",
                 "  • [cyan]/server scan[/cyan] - Scan LAN/hotspot for other PhantomBox servers (shows device type)",
+                "  • [cyan]/server scan --global[/cyan] - LAN scan + probe internet-reachable servers (saved remotes + own public IP)",
                 "  • [cyan]/server --connect <host:port>[/cyan] - Connect to a server (interactive sign-in)",
                 "  • [cyan]/server sign-out[/cyan] - End the remote session on this device",
                 "  • [cyan]/server config[/cyan] - View or change signup auth mode (open|approval|email)",
@@ -3105,20 +3106,10 @@ class PhantomChat(App):
                     port = int(args[i])
             success, msg = start_server(port=port, public_ip=public_ip, host=bind_host)
             if success:
-                cfg = get_server_config()
-                p = cfg.get("port", 8443)
-                cloud = get_cloud_info()
-                ip = cloud.get("public_ip") or get_local_ip()
-                note = (
-                    "\n[dim]VPS/cloud server: devices on this WiFi/Hotspot AND over the internet can reach this address "
-                    "(firewall/security group permitting).[/dim]"
-                    if cloud.get("is_cloud") else ""
-                )
-                await self._add_system_message(
-                    f"[bold green]Server started successfully![/bold green]\n"
-                    f"Address: [bold cyan]http://{ip}:{p}[/bold cyan]\n"
-                    f"Devices on this WiFi/Hotspot can now connect and sign in.{note}"
-                )
+                # Print the server's own start message — on a VPS/cloud host it
+                # contains the interactive instruction box (public URL, firewall,
+                # security group, nginx+certbot, nohup), never a localhost IP.
+                await self._add_system_message(msg)
             else:
                 await self._add_system_message(f"[bold red]Failed to start server:[/bold red] {msg}")
             return
@@ -3132,9 +3123,10 @@ class PhantomChat(App):
                 await self._add_system_message(f"[yellow]{msg}[/yellow]")
             return
 
-        # 3. /server scan — interactive network scan + connect flow
+        # 3. /server scan [--global] — interactive network scan + connect flow
         if subcmd in ("scan", "--discover", "discover", "-d"):
-            await self._run_server_scan_flow()
+            global_scan = "--global" in [a.lower() for a in args[1:]] or "-g" in [a.lower() for a in args[1:]]
+            await self._run_server_scan_flow(global_scan=global_scan)
             return
 
         # 4. /server sign-out
@@ -3321,9 +3313,20 @@ class PhantomChat(App):
             pass
         return None
 
-    async def _run_server_scan_flow(self) -> None:
-        """'/server scan' — discover nearby PhantomBox servers and offer to connect."""
-        from phantombox.server import discover_lan_servers
+    async def _run_server_scan_flow(self, global_scan: bool = False) -> None:
+        """'/server scan' — discover nearby PhantomBox servers and offer to connect.
+
+        With --global: also probe servers reachable over the internet. Sources:
+        • saved remote servers from config (probed by their public/advertised IP)
+        • this box's own public IP (STUN/echo detected) when it is itself a VPS
+        LAN-only sources are skipped in --global mode when they carry no public address.
+        """
+        import socket as _socket
+        from phantombox.server import (
+            discover_lan_servers,
+            get_cloud_info,
+            get_server_config,
+        )
 
         spinner = await self._start_status("Scanning network…")
         try:
@@ -3331,30 +3334,81 @@ class PhantomChat(App):
         finally:
             await self._stop_status(spinner)
 
-        if not found:
-            await self._add_system_message(
+        lines = []
+        if global_scan:
+            lines.append("[bold cyan]Global scan — LAN + internet (public ip:port)[/bold cyan]")
+        else:
+            lines.append("[bold cyan]LAN scan — WiFi/Hotspot network[/bold cyan]")
+
+        if found:
+            lines.append(f"[bold green]Found {len(found)} PhantomBox server(s) on this network:[/bold green]")
+            for idx, s in enumerate(found, 1):
+                dtype = s.get("device_type", "unknown")
+                cloud_tag = f" [yellow]☁ {s.get('cloud')}[/yellow]" if s.get("is_cloud") and s.get("cloud") else (" [yellow]☁[/yellow]" if s.get("is_cloud") else "")
+                lines.append(
+                    f"  [{idx}] [bold]{s.get('server_name')}[/bold] — [cyan]{s.get('ip')}:{s.get('port')}[/cyan] "
+                    f"[dim]({dtype})[/dim]"
+                    f"{cloud_tag}"
+                )
+        else:
+            lines.append(
                 "[bold red]The preferred network is either not open or the entered IP is unreachable, please try again later[/bold red]\n"
                 "[dim]Note: VPS/cloud servers are reachable over the internet by ip:port, not by LAN scan — use the manual address below.[/dim]"
             )
-            await self._run_server_connect_flow("")
-            return
 
-        lines = [f"[bold green]Found {len(found)} PhantomBox server(s) on this network:[/bold green]"]
-        for idx, s in enumerate(found, 1):
-            dtype = s.get("device_type", "unknown")
-            lines.append(
-                f"  [{idx}] [bold]{s.get('server_name')}[/bold] — [cyan]{s.get('ip')}:{s.get('port')}[/cyan] "
-                f"[dim]({dtype})[/dim]"
-            )
-        lines.append("\nType the number to connect, or press enter to cancel.")
+        # --- --global: probe internet-reachable servers -------------------
+        global_found: list = []
+        if global_scan:
+            lan_addrs = {f"{s.get('ip')}:{s.get('port')}" for s in found}
+            spin = await self._start_status("Probing internet-reachable servers…")
+            try:
+                # Sources: saved remotes (by their public/advertised IP) + our own public IP
+                remotes = list_remote_servers()
+                candidates: dict = {}
+                for name, r in (remotes or {}).items():
+                    ip = r.get("public_ip") or r.get("ip") or ""
+                    port = r.get("port") or 8443
+                    if ip and f"{ip}:{port}" not in lan_addrs:
+                        candidates[f"{ip}:{port}"] = name
+                own_cloud = get_cloud_info()
+                if own_cloud.get("is_cloud") and own_cloud.get("public_ip"):
+                    own_addr = f"{own_cloud['public_ip']}:{get_server_config().get('port', 8443)}"
+                    if own_addr not in lan_addrs and own_addr not in candidates:
+                        candidates[own_addr] = _socket.gethostname()
+                for hostport, name in candidates.items():
+                    hp = hostport.split(":")
+                    info = await self._probe_remote_info(hp[0], int(hp[1]) if hp[1].isdigit() else 8443)
+                    if info:
+                        global_found.append({"name": name, "hostport": hostport, "info": info})
+            finally:
+                await self._stop_status(spin)
+            if global_found:
+                lines.append(f"\n[bold green]Internet-reachable server(s) ({len(global_found)}):[/bold green]")
+                for idx, g in enumerate(global_found, 1):
+                    lines.append(
+                        f"  [G{idx}] [bold]{g['name']}[/bold] — [cyan]{g['hostport']}[/cyan] "
+                        f"[dim]({g['info'].get('device_type')}, signup: {g['info'].get('signup_mode')})[/dim]"
+                    )
+            else:
+                lines.append("\n[dim]No internet-reachable PhantomBox servers found (saved remotes or this box's public IP).[/dim]")
+
+        lines.append("\nType the number to connect, [G#] for a global server, or press enter to cancel.")
         await self._add_system_message("\n".join(lines))
 
-        choice = await self._ask_input("Select a server [1-{}] (empty = cancel):".format(len(found)))
-        if not choice or not choice.isdigit() or not (1 <= int(choice) <= len(found)):
+        choice = await self._ask_input("Select a server (empty = cancel):".format())
+        clean = (choice or "").strip().lower()
+        if not clean:
             await self._add_system_message("[dim]Scan cancelled.[/dim]")
             return
-        target = found[int(choice) - 1]
-        await self._run_server_connect_flow(f"{target.get('ip')}:{target.get('port')}")
+        if clean.startswith("g") and clean[1:].isdigit() and global_scan and (1 <= int(clean[1:]) <= len(global_found)):
+            g = global_found[int(clean[1:]) - 1]
+            await self._run_server_connect_flow(g["hostport"])
+            return
+        if clean.isdigit() and found and (1 <= int(clean) <= len(found)):
+            target = found[int(clean) - 1]
+            await self._run_server_connect_flow(f"{target.get('ip')}:{target.get('port')}")
+            return
+        await self._add_system_message("[dim]Scan cancelled.[/dim]")
 
     async def _run_server_connect_flow(self, hostport: str, preset_user: str = "", preset_pass: str = "") -> None:
         """Interactive connect: probe host -> menu (Sign In / Help / Exit) -> auth -> session."""
