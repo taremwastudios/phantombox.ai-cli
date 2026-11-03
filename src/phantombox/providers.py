@@ -7,12 +7,16 @@ via API keys, fetching remote model catalogs, and streaming chat completions wit
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import threading
+import time
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 import httpx
 
 from phantombox.config import load_config, set_config_val
+from phantombox.env import get_data_dir
 
 # Supported providers definition
 PROVIDERS: Dict[str, Dict[str, Any]] = {
@@ -29,9 +33,9 @@ PROVIDERS: Dict[str, Dict[str, Any]] = {
         "no_key_required": True,
     },
     "phantomboxai": {
-        "id": "phantombox",
+        "id": "phantomboxai",
         "name": "PhantomBox",
-        "tag": "PB AI",
+        "tag": "PhantomBox",
         "description": "Official PhantomBox VPS inference",
         "base_url": "https://api-phantombox.phantom-illusions-studio.com/v1",
         "models_url": "https://api-phantombox.phantom-illusions-studio.com/v1/models",
@@ -215,6 +219,17 @@ PROVIDERS: Dict[str, Dict[str, Any]] = {
         "api_key_prefix": "sk-",
         "help_url": "https://platform.deepseek.com/api_keys",
     },
+    "nvidia": {
+        "id": "nvidia",
+        "name": "NVIDIA NIM",
+        "tag": "NVIDIA",
+        "description": "NVIDIA NIM / build.nvidia.com hosted open models (Llama, Nemotron, DeepSeek, Qwen)",
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "models_url": "https://integrate.api.nvidia.com/v1/models",
+        "api_type": "openai",
+        "api_key_prefix": "nvapi-",
+        "help_url": "https://build.nvidia.com/",
+    },
     "huggingface": {
         "id": "huggingface",
         "name": "Hugging Face",
@@ -250,8 +265,15 @@ PROVIDERS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# Cache for fetched remote models catalog
+# Cache for fetched remote models catalog (in-memory, per process)
 _REMOTE_MODELS_CACHE: Dict[str, List[str]] = {}
+
+# Persistent catalog cache survives restarts so /models is instant on every launch.
+# Entries are keyed by provider + a fingerprint of the API key, so rotating a key
+# never serves a catalog fetched with the old one.
+CATALOG_CACHE_FILE = get_data_dir() / "model_catalog_cache.json"
+CATALOG_TTL_SECONDS = 24 * 60 * 60  # 24h
+_CATALOG_LOCK = threading.Lock()
 
 # Stickiness cache: retains active winning model across conversation turns / tool-calling iterations
 _PINNED_ROUTER_MODEL: Optional[Tuple[str, str]] = None
@@ -287,17 +309,50 @@ def get_provider(provider_id: str) -> Optional[Dict[str, Any]]:
     return PROVIDERS.get(clean)
 
 
+# Alternate spellings a user (or /providers --connect) may have used when storing a key
+_PROVIDER_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "anthropic": ("claude",),
+    "phantomboxai": ("phantombox-ai", "phantombox_ai"),
+    "grok": ("xai",),
+    "qwen": ("dashscope",),
+    "qianfan": ("baidu",),
+}
+
+
 def get_provider_key(provider_id: str) -> Optional[str]:
-    """Retrieve stored API key for a provider."""
+    """Retrieve stored API key for a provider.
+
+    The stored config key may differ from the canonical provider id (e.g. the
+    key saved under 'claude' for the 'anthropic' provider), so every known
+    alias spelling is checked before giving up.
+    """
     cfg = load_config()
-    providers_cfg = cfg.get("providers", {})
-    p = providers_cfg.get(provider_id.lower().strip())
-    if isinstance(p, dict):
-        key = p.get("api_key", "").strip()
-        return key if key else None
-    elif isinstance(p, str):
-        key = p.strip()
-        return key if key else None
+    providers_cfg = cfg.get("providers", {}) or {}
+    clean = provider_id.lower().strip()
+    candidates = [clean, *(_PROVIDER_KEY_ALIASES.get(clean, ()))]
+
+    def _read(value: Any) -> Optional[str]:
+        if isinstance(value, dict):
+            key = str(value.get("api_key", "") or "").strip()
+            return key or None
+        if isinstance(value, str):
+            key = value.strip()
+            return key or None
+        return None
+
+    for cand in candidates:
+        found = _read(providers_cfg.get(cand))
+        if found:
+            return found
+
+    # Last resort: a stored key whose canonical provider is this provider.
+    if isinstance(providers_cfg, dict):
+        for stored, value in providers_cfg.items():
+            canonical = get_provider(str(stored))
+            if canonical and canonical.get("id") == clean:
+                found = _read(value)
+                if found:
+                    return found
     return None
 
 
@@ -319,8 +374,11 @@ def set_provider_key(provider_id: str, api_key: str) -> None:
             del providers_cfg[clean_id]
 
     set_config_val("providers", providers_cfg)
-    # Clear cached models
-    _REMOTE_MODELS_CACHE.pop(clean_id, None)
+    # Clear cached models (including alias spellings of the same provider); a new
+    # key may unlock a different catalog, so drop the persisted copy too.
+    for key in (clean_id, *_PROVIDER_KEY_ALIASES.get(clean_id, ())):
+        _REMOTE_MODELS_CACHE.pop(key, None)
+        invalidate_catalog(key)
 
 
 def is_provider_connected(provider_id: str) -> bool:
@@ -336,12 +394,105 @@ def list_connected_providers() -> List[str]:
     return [pid for pid in PROVIDERS if is_provider_connected(pid)]
 
 
-async def fetch_provider_models(provider_id: str) -> List[str]:
+def _normalize_catalog_model_id(mid: str) -> str:
+    """Normalize a model id reported by a provider /models endpoint.
+
+    Google's OpenAI-compatible endpoint reports ids such as 'models/gemini-2.5-flash',
+    but its chat completions endpoint expects the bare 'gemini-2.5-flash'. Returning
+    the prefixed form makes every probe 404, so the provider never shows routes.
+    """
+    mid = (mid or "").strip()
+    if mid.lower().startswith("models/"):
+        mid = mid[len("models/"):]
+    return mid
+
+
+def _key_fingerprint(api_key: str) -> str:
+    """Stable, non-reversible fingerprint of an API key (never store the key itself)."""
+    return hashlib.sha256((api_key or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _load_catalog_cache() -> Dict[str, Dict[str, Any]]:
+    """Read the on-disk catalog cache; tolerate corruption / missing file."""
+    try:
+        if not CATALOG_CACHE_FILE.exists():
+            return {}
+        data = json.loads(CATALOG_CACHE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_catalog_cache(cache: Dict[str, Dict[str, Any]]) -> None:
+    """Persist the catalog cache atomically (tmp + replace) so it never truncates."""
+    try:
+        with _CATALOG_LOCK:
+            tmp = CATALOG_CACHE_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+            tmp.replace(CATALOG_CACHE_FILE)
+    except Exception:
+        pass
+
+
+def _cached_catalog(clean_id: str, api_key: str, allow_stale: bool = False) -> Optional[List[str]]:
+    """Return a persisted catalog for (provider, key) if present and fresh enough.
+
+    A key change invalidates the entry: models fetched with a different key may
+    not be accessible (or may include a different plan's catalog), so we re-fetch.
+    """
+    entry = _load_catalog_cache().get(clean_id)
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("key_fp") != _key_fingerprint(api_key):
+        return None
+    models = entry.get("models")
+    if not isinstance(models, list) or not models:
+        return None
+    age = time.time() - float(entry.get("fetched_at", 0) or 0)
+    if not allow_stale and age > CATALOG_TTL_SECONDS:
+        return None
+    return [str(m) for m in models]
+
+
+def _store_catalog(clean_id: str, api_key: str, models: List[str]) -> None:
+    """Write a successful catalog fetch to the persistent cache."""
+    cache = _load_catalog_cache()
+    cache[clean_id] = {
+        "key_fp": _key_fingerprint(api_key),
+        "models": models,
+        "fetched_at": time.time(),
+    }
+    _save_catalog_cache(cache)
+
+
+def catalog_cache_age(provider_id: str) -> Optional[float]:
+    """Seconds since this provider's catalog was last fetched (None if never)."""
+    entry = _load_catalog_cache().get(provider_id.lower().strip())
+    if not isinstance(entry, dict) or not entry.get("fetched_at"):
+        return None
+    return max(0.0, time.time() - float(entry["fetched_at"]))
+
+
+def invalidate_catalog(provider_id: Optional[str] = None) -> None:
+    """Drop cached catalogs (one provider, or all) from memory and disk."""
+    if provider_id is None:
+        _REMOTE_MODELS_CACHE.clear()
+        _save_catalog_cache({})
+        return
+    clean_id = provider_id.lower().strip()
+    _REMOTE_MODELS_CACHE.pop(clean_id, None)
+    cache = _load_catalog_cache()
+    if cache.pop(clean_id, None) is not None:
+        _save_catalog_cache(cache)
+
+
+async def fetch_provider_models(provider_id: str, force: bool = False) -> List[str]:
     """Fetch the LIVE model catalog from the provider API.
 
     Never returns hardcoded defaults: models shown to the user are always ones
     the endpoint itself reports, so nothing can be 'Model no longer exists'.
-    On fetch failure the cache stays empty and can be retried on next call.
+    Failures are never memoized, so a transient error (timeout, rate limit) can
+    be retried on the next call; pass force=True to bypass a successful cache.
     """
     clean_id = provider_id.lower().strip()
     p_info = get_provider(clean_id)
@@ -352,9 +503,18 @@ async def fetch_provider_models(provider_id: str) -> List[str]:
     if not api_key:
         return []
 
-    # Live catalog already cached
-    if clean_id in _REMOTE_MODELS_CACHE:
+    # 1. In-process cache (fastest path)
+    if not force and clean_id in _REMOTE_MODELS_CACHE:
         return list(_REMOTE_MODELS_CACHE[clean_id])
+
+    # 2. Persistent cache from a previous session (survives restarts, TTL-bounded).
+    #    A forced refresh skips this; a network failure below may still fall back
+    #    to a stale catalog so an offline launch still shows models.
+    if not force:
+        persisted = _cached_catalog(clean_id, api_key)
+        if persisted:
+            _REMOTE_MODELS_CACHE[clean_id] = persisted
+            return list(persisted)
 
     models_url = p_info.get("models_url", "")
     if not models_url:
@@ -381,11 +541,16 @@ async def fetch_provider_models(provider_id: str) -> List[str]:
             resp = await client.get(models_url, headers=headers)
             if resp.status_code == 200:
                 body = resp.json()
-                data = body.get("data", [])
+                data = body.get("data", []) if isinstance(body, dict) else []
+                if not isinstance(data, list):
+                    data = []
                 fetched_ids: List[str] = []
                 for item in data:
                     mid = item.get("id") if isinstance(item, dict) else str(item)
                     if not mid or not isinstance(mid, str):
+                        continue
+                    mid = _normalize_catalog_model_id(mid)
+                    if not mid:
                         continue
                     m_lower = mid.lower()
                     # Filter out non-chat / utility models
@@ -394,16 +559,52 @@ async def fetch_provider_models(provider_id: str) -> List[str]:
                     fetched_ids.append(mid)
 
                 if fetched_ids:
-                    result = sorted(fetched_ids)
+                    result = sorted(set(fetched_ids))
                     _REMOTE_MODELS_CACHE[clean_id] = result
+                    _store_catalog(clean_id, api_key, result)
                     return result
     except Exception:
         pass
 
-    # Fetch failed: cache an empty list (NOT stale defaults) so it can be retried
-    # later without ever showing the user a model that no longer exists.
-    _REMOTE_MODELS_CACHE[clean_id] = []
+    # Fetch failed: do NOT memoize the failure, so /models and /phantombox --routes
+    # rescan can retry instead of showing an empty catalog for the whole session.
+    # However, a stale on-disk catalog is better than nothing when the network or
+    # provider is temporarily down (offline launch / rate limit).
+    _REMOTE_MODELS_CACHE.pop(clean_id, None)
+    stale = _cached_catalog(clean_id, api_key, allow_stale=True)
+    if stale:
+        return stale
     return []
+
+
+def split_router_mode_suffix(model_identifier: str) -> Tuple[str, str]:
+    """Split a router identifier from its routing-mode suffix.
+
+    Returns (base, suffix) where suffix is one of ``shuffle``, ``overdrive`` or
+    ``<provider>`` (as printed in the prompt tag, e.g. ``phantombox/router/shuffle``),
+    or ``""`` when there is none. Any other trailing segment is *not* a mode and
+    is left in ``base`` untouched, so a bogus argument never silently changes how
+    the router behaves.
+    """
+    from phantombox.router import get_overdrive_model, get_provider_filter, is_shuffle_mode
+
+    clean = (model_identifier or "").strip()
+    valid_suffixes = {"shuffle"}
+    try:
+        od = get_overdrive_model()
+        if od:
+            valid_suffixes.add("overdrive")
+        pf = get_provider_filter()
+        if pf:
+            valid_suffixes.add(str(pf).lower())
+    except Exception:
+        pass
+    for base in ("phantombox/router", "phantombox/routes", "phantombox/router-adaptive"):
+        if clean.lower().startswith(base + "/"):
+            suffix = clean[len(base) + 1 :].strip().lower()
+            if suffix in valid_suffixes or suffix == "overdrive":
+                return base, suffix
+    return clean, ""
 
 
 def parse_model_identifier(model_identifier: str) -> Tuple[Optional[Dict[str, Any]], str]:
@@ -411,8 +612,14 @@ def parse_model_identifier(model_identifier: str) -> Tuple[Optional[Dict[str, An
     Parse a model string (e.g. 'openrouter:anthropic/claude-3.7-sonnet' or 'groq/llama-3.3-70b-versatile').
     Returns (provider_info, stripped_model_id).
     If it's a local model, returns (None, model_identifier).
+
+    Router mode suffixes (``phantombox/router/shuffle``, ``.../overdrive``,
+    ``phantombox/routes/<provider>``) are stripped first: without that, every
+    mode-tagged identifier fell through to the local-model branch and was sent to
+    a llama.cpp server that does not exist.
     """
-    clean = model_identifier.strip()
+    clean, _mode = split_router_mode_suffix(model_identifier)
+    clean = clean.strip()
     if not clean:
         return None, clean
 
@@ -458,6 +665,141 @@ def format_model_display_name(model_identifier: str) -> str:
     return model_identifier
 
 
+async def _stream_openai_compatible(
+    url: str,
+    headers: Dict[str, str],
+    body: Dict[str, Any],
+    label: str,
+    model_id: str = "",
+    timeout: float = 120.0,
+) -> AsyncGenerator[Dict[str, Any], None]:
+    """POST a streaming chat request and yield OpenAI-style delta objects.
+
+    This is the single implementation shared by every OpenAI-compatible endpoint
+    (local llama.cpp, Remote PhantomBox Server, and all cloud providers), so a
+    provider addition stays a data-only change in PROVIDERS.
+    """
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream("POST", url, headers=headers, json=body) as response:
+            if response.status_code != 200:
+                err_text = (await response.aread()).decode("utf-8", errors="replace")
+                try:
+                    err_json = json.loads(err_text)
+                    message = err_json.get("error", {}).get("message") or err_text
+                except Exception:
+                    message = err_text
+                suffix = f" for model '{model_id}'" if model_id else ""
+                raise RuntimeError(f"API Error ({response.status_code}) from {label}{suffix}: {message}")
+
+            async for line in response.aiter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
+                data = line[6:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                    delta = chunk["choices"][0]["delta"]
+                except Exception:
+                    continue
+                if delta:
+                    yield delta
+
+
+def _model_tool_source(model_id: str) -> str:
+    """The provider a model's tools come from ('local' for llama.cpp)."""
+    from phantombox.providers import parse_model_identifier
+
+    p_info, _raw = parse_model_identifier(model_id)
+    if not p_info:
+        return "local"
+    if p_info.get("api_type") == "router":
+        return "phantombox"
+    return str(p_info.get("id", ""))
+
+
+def _tools_for_source(
+    source: str,
+    tools: List[Dict[str, Any]],
+    model_id: str = "",
+) -> List[Dict[str, Any]]:
+    """Filter a tool pool down to what one provider can actually use.
+
+    PhantomBox's tool model is "built-ins + tools reachable from this provider".
+    Concretely that means:
+
+    * ``source == "phantombox"`` (router) -> the full pool. The router re-pools per
+      route before dispatching, so it can never hand a tool to a model that
+      cannot run it.
+    * any other connected provider -> PhantomBox built-ins only. Cloud inference
+      APIs do not publish their own tool catalog; the tools a cloud model can
+      run are the ones the *client* declares in the request. A provider's tools
+      are therefore whatever MCP servers/connectors you attached to this app
+      (stdio, HTTP, or hosted remote MCP), which are surfaced as MCP tools.
+    """
+    if not tools:
+        return []
+    from phantombox.capabilities import supports_tools
+
+    if source == "phantombox":
+        return tools
+    if model_id and supports_tools(source, model_id) is False:
+        return []
+    return [t for t in tools if "__" not in str(t.get("function", {}).get("name", ""))]
+
+
+def _openai_base_body(model_id: str, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Common request body for OpenAI-compatible /chat/completions endpoints."""
+    body: Dict[str, Any] = {
+        "model": model_id,
+        "messages": messages,
+        "stream": True,
+        "temperature": 0.7,
+    }
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
+    return body
+
+
+def _tools_for_model(provider_id: str, model_id: str, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Pool the tool set that is actually valid for one specific model.
+
+    Every connected endpoint receives the PhantomBox tool pool -- built-in tools
+    *plus* every connected MCP server's tools -- but not blindly:
+
+    * a model that is *known* not to support function calling gets no schemas at
+      all (sending them causes 400s on strict endpoints and wasted tokens
+      everywhere else);
+    * some endpoints (notably Google's OpenAI-compat layer) reject schemas that
+      carry non-standard keywords, so those are stripped before sending while
+      the tool itself is kept -- the model still gets the capability.
+    """
+    if not tools:
+        return []
+
+    from phantombox.capabilities import supports_tools
+
+    if supports_tools(provider_id, model_id) is False:
+        return []
+
+    if (provider_id or "").lower() in ("gemini", "google"):
+        cleaned: List[Dict[str, Any]] = []
+        for t in tools:
+            fn = dict(t.get("function", {}) or {})
+            fn.pop("strict", None)
+            params = dict(fn.get("parameters") or {})
+            params.pop("$schema", None)
+            for prop in (params.get("properties") or {}).values():
+                if isinstance(prop, dict):
+                    prop.pop("default", None)
+            fn["parameters"] = params
+            cleaned.append({"type": "function", "function": fn})
+        return cleaned
+
+    return tools
+
+
 async def stream_chat_deltas(
     model_identifier: str,
     local_port: int,
@@ -472,30 +814,16 @@ async def stream_chat_deltas(
 
     # 1. Local model via llama.cpp server
     if not p_info:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            async with client.stream(
-                "POST",
-                f"http://127.0.0.1:{local_port}/v1/chat/completions",
-                json={
-                    "messages": messages,
-                    "tools": tools,
-                    "stream": True,
-                    "temperature": 0.7,
-                },
-            ) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line or not line.startswith("data: "):
-                        continue
-                    data = line[6:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                        delta = chunk["choices"][0]["delta"]
-                        yield delta
-                    except Exception:
-                        continue
+        body = _openai_base_body(model_identifier, messages, tools)
+        # Tiny local servers do not require a model id, but sending it is harmless
+        # and makes llama.cpp's router mode pick the right slot.
+        async for delta in _stream_openai_compatible(
+            f"http://127.0.0.1:{local_port}/v1/chat/completions",
+            {},
+            body,
+            label=f"local:{model_identifier}",
+        ):
+            yield delta
         return
 
     # 2. PhantomBox Autonomous Smart Router / Subagents
@@ -527,44 +855,23 @@ async def stream_chat_deltas(
             "Authorization": auth_header,
             "Content-Type": "application/json",
         }
-        body: Dict[str, Any] = {
-            "model": raw_model_id,
-            "messages": messages,
-            "stream": True,
-            "temperature": 0.7,
-        }
-        if tools:
-            body["tools"] = tools
+        body = _openai_base_body(raw_model_id, messages, _tools_for_model(srv_name, raw_model_id, tools))
 
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            async with client.stream(
-                "POST",
-                f"{base_url}/v1/chat/completions",
-                headers=headers,
-                json=body,
-            ) as response:
-                if response.status_code != 200:
-                    err_txt = (await response.aread()).decode("utf-8", errors="replace")
-                    raise RuntimeError(f"Remote server error ({response.status_code}): {err_txt}")
-
-                async for line in response.aiter_lines():
-                    if not line or not line.startswith("data: "):
-                        continue
-                    data = line[6:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                        delta = chunk["choices"][0]["delta"]
-                        yield delta
-                    except Exception:
-                        continue
+        async for delta in _stream_openai_compatible(
+            f"{base_url}/v1/chat/completions",
+            headers,
+            body,
+            label=f"remote server '{srv_name}'",
+            model_id=raw_model_id,
+            timeout=180.0,
+        ):
+            yield delta
         return
 
     # 3. Remote Cloud Provider
     api_key = get_provider_key(p_info["id"])
     if not api_key:
-        raise ValueError(f"No API key configured for provider '{p_info['name']}'. Run /mcp --connect to set your key.")
+        raise ValueError(f"No API key configured for provider '{p_info['name']}'. Run /providers --connect to set your key.")
 
     # Anthropic Messages API
     if p_info.get("api_type") == "anthropic":
@@ -606,7 +913,7 @@ async def stream_chat_deltas(
                 })
 
         anthropic_tools: List[Dict[str, Any]] = []
-        for t in tools:
+        for t in _tools_for_model(p_info["id"], raw_model_id, tools):
             fn = t.get("function", {})
             anthropic_tools.append({
                 "name": fn.get("name"),
@@ -677,83 +984,65 @@ async def stream_chat_deltas(
                         continue
         return
 
-    # Standard OpenAI-compatible endpoints (OpenRouter, Groq, OpenAI, Gemini, Qwen, DeepSeek, Mistral)
+    # Standard OpenAI-compatible endpoints (OpenRouter, Groq, OpenAI, Gemini, Qwen, DeepSeek, Mistral, NVIDIA)
     base_url = p_info["base_url"].rstrip("/")
     url = f"{base_url}/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    if p_info["id"] == "openrouter":
-        headers["HTTP-Referer"] = "https://phantombox.ai"
-        headers["X-Title"] = "phantombox"
+    headers.update(_provider_headers(p_info, api_key))
 
+    body = _openai_base_body(
+        raw_model_id,
+        _prepare_messages(p_info["id"], messages),
+        _tools_for_model(p_info["id"], raw_model_id, tools),
+    )
+    body.update(_provider_body_extras(p_info["id"], raw_model_id))
+
+    async for delta in _stream_openai_compatible(
+        url,
+        headers,
+        body,
+        label=p_info["name"],
+        model_id=raw_model_id,
+    ):
+        yield delta
+
+
+def _provider_headers(p_info: Dict[str, Any], api_key: str) -> Dict[str, str]:
+    """Provider-specific extra request headers (data-driven where possible)."""
+    headers: Dict[str, str] = dict(p_info.get("extra_headers") or {})
+    if p_info["id"] == "openrouter":
+        headers.setdefault("HTTP-Referer", "https://phantombox.ai")
+        headers.setdefault("X-Title", "phantombox")
+    return {k: str(v) for k, v in headers.items()}
+
+
+def _prepare_messages(provider_id: str, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Provider-specific message rewriting before the request is sent."""
     # Gemini-specific OpenAI compatibility handling for thought signatures:
-    # When sending assistant tool_calls back in multi-turn conversations, if the model is a thinking
-    # model (such as Gemini 2.5 / 3 preview), Google requires thought_signature on toolCall parts,
-    # OR thinking_budget = 0 / reasoning off to avoid requiring cryptographic thought signatures.
-    cleaned_messages = messages
-    if p_info["id"] == "gemini":
-        cleaned_messages = []
+    # When sending assistant tool_calls back in multi-turn conversations, Google
+    # requires thought_signature on toolCall parts for thinking models.
+    if provider_id == "gemini":
+        cleaned: List[Dict[str, Any]] = []
         for msg in messages:
             msg_copy = dict(msg)
             if msg_copy.get("role") == "assistant" and msg_copy.get("tool_calls"):
-                cleaned_tool_calls = []
-                for tc in msg_copy["tool_calls"]:
-                    tc_dict = dict(tc)
-                    # If thought_signature is missing on this function call, Gemini 400s
-                    # We ensure thought_signature is present if provided, or provide fallback
-                    if "thought_signature" not in tc_dict and "thought_signature" not in tc_dict.get("function", {}):
-                        # Add dummy / empty signature or pass through
-                        pass
-                    cleaned_tool_calls.append(tc_dict)
-                msg_copy["tool_calls"] = cleaned_tool_calls
-            cleaned_messages.append(msg_copy)
+                msg_copy["tool_calls"] = [dict(tc) for tc in msg_copy["tool_calls"]]
+            cleaned.append(msg_copy)
+        return cleaned
+    return messages
 
-    body: Dict[str, Any] = {
-        "model": raw_model_id,
-        "messages": cleaned_messages,
-        "stream": True,
-        "temperature": 0.7,
-    }
-    if tools:
-        body["tools"] = tools
 
-    # For Gemini reasoning/thinking models (like gemini-3-flash-preview, gemini-2.5-flash),
-    # disabling the internal thinking budget for tool calls prevents the thought_signature validation error
-    if p_info["id"] == "gemini" and ("gemini-3" in raw_model_id or "preview" in raw_model_id):
-        # Allow disabling thinking or configuring reasoning_effort
-        body["reasoning_effort"] = "none"
-
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        async with client.stream(
-            "POST",
-            url,
-            headers=headers,
-            json=body,
-        ) as response:
-            if response.status_code != 200:
-                err_body = await response.aread()
-                err_text = err_body.decode("utf-8", errors="replace")
-                try:
-                    err_json = json.loads(err_text)
-                    msg = err_json.get("error", {}).get("message") or err_text
-                except Exception:
-                    msg = err_text
-                raise RuntimeError(f"API Error ({response.status_code}) from {p_info['name']} for model '{raw_model_id}': {msg}")
-
-            async for line in response.aiter_lines():
-                if not line or not line.startswith("data: "):
-                    continue
-                data = line[6:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                    delta = chunk["choices"][0]["delta"]
-                    yield delta
-                except Exception:
-                    continue
+def _provider_body_extras(provider_id: str, model_id: str) -> Dict[str, Any]:
+    """Provider-specific extra body fields."""
+    extras: Dict[str, Any] = {}
+    # Disabling the thinking budget for Gemini reasoning models prevents the
+    # thought_signature validation error on tool-call turns.
+    if provider_id == "gemini" and ("gemini-3" in model_id or "preview" in model_id):
+        extras["reasoning_effort"] = "none"
+    return extras
 
 
 def fetch_cached_or_default_models(provider_id: str) -> List[str]:

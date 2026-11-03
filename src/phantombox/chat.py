@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import re
+import threading
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -13,7 +14,7 @@ from rich.markdown import Markdown
 from textual import events, work
 from textual.app import App, ComposeResult
 from textual.color import Color
-from textual.containers import Container, VerticalScroll, Horizontal
+from textual.containers import Container, VerticalScroll, Horizontal, Grid
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Static, Label, OptionList, TextArea, Input, Button
@@ -50,14 +51,46 @@ from phantombox.providers import (
     stream_chat_deltas,
 )
 
-# Straight, solid block ASCII logo for phantombox.ai (matches image3.png, filled with white)
-ASCII_BANNER = """█▀█ █ █ ▄▀█ █▄ █ ▀█▀ █ █ █▀▄▀█ █▀▄ █ █ ▀▄▀   ▄▀█ █
-█▀▀ █▀█ █▀█ █ ▀█  █  █▄█ █ █ █ █▄▀ █▄█ █ █ ▄ █▀█ █
-▀   ▀ ▀ ▀ ▀ ▀  ▀  ▀  ▀ ▀ ▀   ▀ ▀▀  ▀ ▀ ▀ ▀   ▀ ▀ ▀"""
+from phantombox import branding
+
+# Starter prompts shown as rounded, differently-coloured chips on the welcome
+# screen (replaces the old one-line help text). (label, prompt, colour)
+WELCOME_CHIPS = [
+    ("Tour code", "Give me a tour of this project: what it does, how it is structured, and where the entry points are.", "#58a6ff"),
+    ("Script it", "Write a Python script that organises files in my workspace by type, and save it to disk.", "#3fb950"),
+    ("Fix a bug", "Help me debug an issue. Ask me for the error message and the relevant file, then propose a fix.", "#f97316"),
+    ("Summarise", "Read the file I name and give me a short, structured summary of what it does.", "#a371f7"),
+    ("Web search", "Search the web for the latest on a topic I give you and summarise the key points with sources.", "#eab308"),
+    ("Models", "Compare the models I have connected for coding, speed and cost, and recommend one.", "#2dd4bf"),
+    ("Email", "Draft a short, professional email for the situation I describe.", "#ec4899"),
+    ("Plan", "Help me break a project down into milestones and concrete next steps.", "#f43f5e"),
+    ("Review", "Review the code I paste for bugs, clarity and performance, and suggest specific changes.", "#8b949e"),
+    ("Setup", "Show me how to connect a provider with /providers --connect and verify my routes with /phantombox --routes.", "#d29922"),
+]
 
 
 class PromptArea(TextArea):
-    """Auto-expanding text area that submits on Enter and allows Shift+Enter for newlines."""
+    """Prompt input with Enter=send, Shift+Enter=newline and ↑/↓ history.
+
+    Behaviour (see also the prompt-box documentation in README / chat docstring):
+
+    * ``Enter``            submits and clears the box.
+    * ``Shift+Enter``      inserts a newline.
+    * ``Up`` / ``Down``    step through previously sent messages. History is only
+      engaged when the cursor is on the *first* line (Up) or the *last* line
+      (Down), so normal multi-line cursor movement still works inside a long
+      draft — this is how modern chat UIs behave.
+    * The widget grows with its content (see ``on_text_area_changed``) up to a
+      configurable maximum, then scrolls internally instead of pushing the
+      layout off-screen.
+
+    The owning app calls ``set_history()`` whenever a message is sent.
+    """
+
+    # Height budget: content rows plus 1 blank padding row. Both boxes start at
+    # MIN_LINES (5) so the welcome and docked cards keep matching heights.
+    MIN_LINES = 4
+    MAX_LINES = 12
 
     class Submitted(Message):
         def __init__(self, value: str) -> None:
@@ -67,29 +100,93 @@ class PromptArea(TextArea):
     def __init__(self, placeholder: str = "", **kwargs) -> None:
         super().__init__(placeholder=placeholder, **kwargs)
         self.show_line_numbers = False
+        self._history: List[str] = []
+        self._history_index: Optional[int] = None   # None = live draft
+        self._draft: str = ""                        # draft saved when browsing
 
+    # -- history ---------------------------------------------------------
+    def set_history(self, history: List[str]) -> None:
+        self._history = list(history)
+        self._history_index = None
+
+    def _restore_draft(self) -> None:
+        self.load_text(self._draft)
+        self.move_cursor(self.document.end)
+
+    def _browse_history(self, delta: int) -> None:
+        """Move through history by ``delta`` (-1 = older, +1 = newer)."""
+        if not self._history:
+            return
+        if self._history_index is None:
+            if delta > 0:
+                return  # already at the newest entry / live draft
+            self._draft = self.text
+            self._history_index = len(self._history) - 1
+        else:
+            self._history_index += delta
+
+        if self._history_index >= len(self._history):
+            self._history_index = None
+            self._restore_draft()
+            return
+        if self._history_index < 0:
+            self._history_index = 0
+
+        self.load_text(self._history[self._history_index])
+        self.move_cursor(self.document.end)
+
+    # -- key handling ----------------------------------------------------
     async def _on_key(self, event: events.Key) -> None:
-        if event.key == "enter":
-            # Enter submits, Shift+Enter makes newline
+        if event.key in ("enter", "ctrl+j"):
             event.prevent_default()
             event.stop()
             val = self.text.strip()
-            self.text = ""
-            self.styles.height = 4
+            self.load_text("")
+            self.styles.height = self._height_for_lines(1)
             if val:
                 self.post_message(self.Submitted(val))
             return
-        elif event.key == "shift+enter":
-            # Insert newline
+        if event.key == "shift+enter":
             event.prevent_default()
             event.stop()
             self.insert("\n")
             return
+
+        if event.key == "up" and self._history:
+            row = self.selection.start[0]
+            if row == 0:
+                event.prevent_default()
+                event.stop()
+                self._browse_history(-1)
+                return
+        if event.key == "down" and (self._history_index is not None):
+            row = self.selection.start[0]
+            if row >= self.document.line_count - 1:
+                event.prevent_default()
+                event.stop()
+                self._browse_history(+1)
+                return
+
         await super()._on_key(event)
 
+    # -- flexing ---------------------------------------------------------
+    def _height_for_lines(self, line_count: int) -> int:
+        """Outer widget height for a given number of content lines.
+
+        One extra row of breathing room keeps the text off the card's border,
+        matching the reference prompt box.
+        """
+        visible = max(self.MIN_LINES, min(line_count, self.MAX_LINES))
+        return visible + 1
+
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
-        lines = max(1, min(event.text_area.document.line_count, 10))
-        self.styles.height = lines + 3
+        # Counting *visual* rows (wrapped lines) rather than hard newlines means
+        # a long single-line message grows the box too, as modern chat UIs do.
+        width = max(10, self.size.width - 2)
+        visual_rows = 0
+        for line in event.text_area.text.split("\n"):
+            visual_rows += max(1, -(-len(line) // width))
+        self.styles.height = self._height_for_lines(visual_rows)
 
 
 class SpinnerThinking(Static):
@@ -107,6 +204,11 @@ class SpinnerThinking(Static):
         if self.spinner_color:
             self.styles.color = self.spinner_color
         self.set_interval(0.08, self._next_frame)
+
+    def set_label(self, text: str) -> None:
+        """Change the text next to the spinner without restarting it."""
+        self.label_text = text
+        self.update(f"{self.FRAMES[self._frame_idx]} {text}")
 
     def _next_frame(self) -> None:
         self._frame_idx = (self._frame_idx + 1) % len(self.FRAMES)
@@ -183,7 +285,7 @@ class ModelPickerModal(ModalScreen[str | None]):
                 yield ol
                 yield Static("Enter: Select  •  Esc: Cancel  •  ↑/↓: Navigate", id="picker-help")
             else:
-                yield Static("No local models or connected cloud providers found.\nRun 'phantombox pull' or '/mcp --connect' to connect providers.", id="picker-empty")
+                yield Static("No local models or connected cloud providers found.\nRun 'phantombox pull' or '/providers --connect' to connect providers.", id="picker-empty")
                 yield Static("Esc: Close", id="picker-help")
 
     def on_mount(self) -> None:
@@ -794,6 +896,46 @@ def format_assistant_markdown(text: str) -> str:
         return "**Thinking...**\n" + "\n".join(lines)
 
 
+class SuggestionChip(Static):
+    """Rounded, coloured starter-prompt chip shown on the welcome screen.
+
+    Clicking one (or tabbing to it and pressing Enter) submits its prompt, which
+    is the behaviour users expect from modern chat landing pages.
+    """
+
+    can_focus = True
+
+    class Selected(Message):
+        def __init__(self, prompt: str) -> None:
+            super().__init__()
+            self.prompt = prompt
+
+    def __init__(self, label: str, prompt: str, color: str, **kwargs) -> None:
+        # Short, single-line display label. The chip is deliberately narrow, so the
+        # full text lives in the tooltip and in `prompt` — showing 30+ chars here
+        # made every card truncate to a fragment ("Explain this", "Write a").
+        super().__init__(label, **kwargs)
+        self.prompt = prompt
+        self.chip_color = color
+        self.tooltip = prompt
+        self.styles.border = ("round", color)
+        self.styles.color = color
+
+    def on_click(self) -> None:
+        self.post_message(self.Selected(self.prompt))
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "enter":
+            event.stop()
+            self.post_message(self.Selected(self.prompt))
+
+    def on_focus(self) -> None:
+        self.styles.text_style = "bold"
+
+    def on_blur(self) -> None:
+        self.styles.text_style = "none"
+
+
 class ChatMessage(Container):
     """A chat message widget supporting user, assistant, system, and tool roles."""
 
@@ -904,6 +1046,42 @@ class SuggestionsRow(Container):
         self.post_message(self.Selected(chosen_text))
 
 
+class HeroLogo(Static):
+    """Small, filled, shadowed "phantombox.ai" wordmark for the welcome screen.
+
+    A single static render -- no animation, no timer. Re-coloured via
+    ``set_color`` when the user runs /color.
+    """
+
+    def __init__(self, color: str = "#f97316", **kwargs) -> None:
+        kwargs.setdefault("markup", False)
+        rows = branding.logo_frames()[0]
+        super().__init__("\n".join(rows), **kwargs)
+        self.logo_color = color
+
+    def on_mount(self) -> None:
+        self.styles.color = self.logo_color
+
+    def set_color(self, color: str) -> None:
+        self.logo_color = color
+        try:
+            self.styles.color = color
+        except Exception:
+            pass
+
+    def show_animation(self) -> None:
+        """No-op: the wordmark is static now (kept for _apply_hero)."""
+        pass
+
+    def show_plain(self) -> None:
+        """Fallback for terminals without block glyphs."""
+        self.update("\n".join(branding.logo_plain_rows()))
+
+    def stop(self) -> None:
+        """No-op: nothing animates."""
+        pass
+
+
 class PhantomChat(App):
     """Main chat application styled after OpenCode."""
 
@@ -940,43 +1118,149 @@ class PhantomChat(App):
         align: center middle;
     }
 
-    #hero-banner {
-        width: 100%;
-        content-align: center middle;
-        text-align: center;
-        color: #ffffff;
-        text-style: bold;
-        margin-bottom: 2;
-    }
-
-    /* OpenCode prompt card with bottom bar - increased height */
-    #welcome-prompt-card {
+    # Hero row: the animated wordmark gets room above it (a widget that starts
+    # exactly at y=0 loses its top line to the container edge).
+    #hero-row {
         width: 100%;
         height: auto;
-        background: #161b22;
-        border: round #f97316;
-        padding: 0;
+        align: center middle;
         margin-bottom: 1;
+        padding-top: 2;
     }
 
-    #welcome-prompt-card:focus-within {
-        border: round #f97316;
-    }
-
-    #welcome-prompt-card PromptArea {
+    # Hero: the animated wordmark (logo.txt) sits centred on its own row.
+    # Hero row: the animated wordmark gets room above it (a widget that starts
+    # exactly at y=0 loses its top line to the container edge) and the grid below
+    # is sized so the whole block stays vertically centred.
+    #hero-row {
         width: 100%;
+        height: auto;
+        align: center middle;
+        margin-bottom: 1;
+        padding-top: 2;
+    }
+
+    #hero-banner {
+        width: auto;
+        height: auto;
+        content-align: center middle;
+        text-align: center;
+        color: #f97316;
+        padding: 0 1;
+    }
+
+    /* ---------------------------------------------------------------------
+       Prompt card (both welcome + dock variants)
+
+       Requirements this implements:
+         * the card background stays dark; the *border* carries the /color
+           accent, together with the selected-model tag inside the footer
+         * taller box -> PromptArea starts at 4 rows and flexes upward
+         * the *same* look is kept once chat starts (dock card mirrors these)
+       --------------------------------------------------------------------- */
+    #welcome-prompt-card, #dock-prompt-card {
+       width: 100%;
+       height: auto;
+       background: #0d1117;
+       border: round #f97316;
+       padding: 0;
+    }
+
+    #welcome-prompt-card:focus-within, #dock-prompt-card:focus-within {
+       background: #0d1117;
+       border: round #f97316;
+    }
+
+    /* Inner input layer: 1 cell inside the border, same dark colour, so the
+       border reads as a ring around the dark box. */
+    #welcome-prompt-card PromptArea, #dock-prompt-card PromptArea {
+       width: 100%;
+       /* Taller box: 5 content rows (was 3 originally, 4 in the last pass).
+           The widget grows from here as the user types (see
+           PromptArea._height_for_lines). */
+       height: 5;
+       min-height: 5;
+       background: #0d1117;
+       border: none;
+       margin: 0 1 1 1;
+       color: #e6edf3;
+       /* No padding: the widget background is the one and only text layer. */
+        padding: 0;
+        /* Hide scrollbars: their track drew a darker stripe down the box, which
+           reads as the "shadow behind the text" the redesign removes. */
+        scrollbar-size: 0 0;
+        scrollbar-color: #0d1117;
+    }
+
+    #welcome-prompt-card PromptArea > .text-area--cursor-line,
+    #dock-prompt-card PromptArea > .text-area--cursor-line {
+        background: transparent;
+    }
+
+    /* No focus highlight ring inside the text area: the card border already
+       communicates focus, and an inner band reads as an unwanted shadow. */
+    #welcome-prompt-card PromptArea:focus, #dock-prompt-card PromptArea:focus {
         background: transparent;
         border: none;
-        color: #e6edf3;
-        padding: 1 1 0 1;
-        height: 4;
     }
 
     #welcome-box-footer {
         width: 100%;
         height: 1;
         background: #0d1117;
-        padding: 0 2;
+        padding: 0 1;
+    }
+
+    #dock-box-footer {
+        width: 100%;
+        height: 1;
+        background: #0d1117;
+        padding: 0 1;
+    }
+
+    /* Footer baseline sits inside the card; give it a little breathing room
+       above so the border and the footer text don't touch. */
+    #welcome-box-footer, #dock-box-footer {
+        margin-top: 0;
+    }
+
+    /* ---------------------------------------------------------------------
+       Starter-prompt chips (replace the old help text line)
+       --------------------------------------------------------------------- */
+    # Starter prompts as an evenly-sized grid of compact pills. Equal 1fr
+    # columns keep every chip the same width; short labels get padding rather
+    # than truncation so nothing is cut off.
+    #welcome-chips {
+        width: 100%;
+        height: auto;
+        /* Every track the same explicit width: '1fr' divided the leftover
+           space unevenly (rounding), which made two chips a cell wider. */
+        grid-size: 5 2;
+        grid-gutter: 0 0;
+        grid-rows: 3;
+        margin: 0;
+        align: center middle;
+    }
+
+    .chip {
+        /* Fixed width in every track: 'auto'/1fr resolved to 11 or 12 cells
+           depending on label length, so the pills were visibly unequal. */
+        width: 16;
+        min-width: 16;
+        max-width: 16;
+        height: 3;
+        max-height: 3;
+        content-align: center middle;
+        text-align: center;
+        background: #0d1117;
+        border: round #30363d;
+        padding: 0 1;
+        margin: 0;
+    }
+
+    .chip:focus {
+        background: #1c2430;
+        text-style: bold;
     }
 
     .box-model-tag {
@@ -1004,6 +1288,8 @@ class PhantomChat(App):
         margin-top: 1;
     }
 
+    /* Kept for backwards compatibility: no welcome screen uses this any more */
+
     /* =========================================================================
        Active Chat Log View
        ========================================================================= */
@@ -1015,41 +1301,13 @@ class PhantomChat(App):
         scrollbar-size-vertical: 0;
     }
 
-    /* Docked prompt box at bottom during chat - increased height */
+    /* Docked prompt box at bottom during chat — mirrors the welcome card */
     #dock-container {
         dock: bottom;
         display: none;
         background: #0d1117;
-        padding: 1 2 1 2;
+        padding: 0 2 1 2;
         height: auto;
-    }
-
-    #dock-prompt-card {
-        width: 100%;
-        height: auto;
-        background: #161b22;
-        border: round #f97316;
-        padding: 0;
-    }
-
-    #dock-prompt-card:focus-within {
-        border: round #f97316;
-    }
-
-    #dock-prompt-card PromptArea {
-        width: 100%;
-        background: transparent;
-        border: none;
-        color: #e6edf3;
-        padding: 1 1 0 1;
-        height: 4;
-    }
-
-    #dock-box-footer {
-        width: 100%;
-        height: 1;
-        background: #090d13;
-        padding: 0 2;
     }
 
     /* Message rows */
@@ -1300,60 +1558,83 @@ class PhantomChat(App):
 
         # Tool confirmation future for pause/resume
         self._pending_confirmation: Optional[asyncio.Future[str]] = None
+        # Set when the active model cannot use tools, so the user is told once.
+        self._tools_disabled_notice_pending = False
+
+        # Remote session state: set when this client connects to another
+        # PhantomBox host (/server scan -> Sign In). While active, all host
+        # settings/commands are read-only — users can only switch models,
+        # interact with them, and search routes. Cleared on sign-out.
+        self.remote_session: Optional[Dict[str, Any]] = None  # {host, port, username, url, token}
 
         # Generation control & stop handling
         self._is_generating: bool = False
         self._stop_requested: bool = False
         self._current_thinking_container: Optional[Container] = None
 
+        # Most recent sent messages, shared by both prompt boxes for ↑/↓ recall.
+        self._prompt_history: List[str] = []
+
+        # Router attribution for the current turn ({model, provider, time, ...}).
+        self._last_router_meta: Dict[str, Any] = {}
+
     def compose(self) -> ComposeResult:
         with Container(id="welcome-container"):
             with Container(id="welcome-wrapper"):
-                yield Static(ASCII_BANNER, id="hero-banner")
+                # Hero: the animated wordmark from logo.txt (no separate icon
+                # columns or static brand banner any more).
+                with Container(id="hero-row"):
+                    yield HeroLogo(color=self.theme_color, id="hero-banner")
+                # Prompt card: the colour layer reaches the card edges (no inner
+                # shadow, no padding behind the text) and the box is taller.
                 with Container(id="welcome-prompt-card"):
                     yield PromptArea(
-                        placeholder="Ask phantombox anything, or type / to run a command...",
+                        placeholder="Ask phantombox anything, or type /help for commands...",
                         id="welcome-prompt",
                     )
                     with Horizontal(id="welcome-box-footer"):
                         yield Label(f"● {format_model_display_name(self.model_name)}", id="welcome-model-tag", classes="box-model-tag")
                         yield Label("", id="welcome-context-tag", classes="box-context-tag")
                         yield Static(classes="box-footer-spacer")
-                        yield Label("Run /help for commands", classes="box-hint-tag")
-                yield Static(
-                    "[dim]/settings[/dim] Permissions  •  [dim]/models[/dim] Switch model  •  [dim]/server[/dim] LAN Server  •  [dim]/mcp --connect[/dim] Connect APIs  •  [dim]/color[/dim] Theme",
-                    id="welcome-commands",
-                )
+                        yield Label("enter send · shift+enter newline · ↑↓ history", classes="box-hint-tag")
+                # Starter prompts replace the old help line (the footer keeps /help).
+                with Grid(id="welcome-chips"):
+                    for label, prompt, color in WELCOME_CHIPS:
+                        yield SuggestionChip(label, prompt, color, classes="chip")
 
         yield VerticalScroll(id="chat-view")
 
         with Container(id="dock-container"):
             with Container(id="dock-prompt-card"):
                 yield PromptArea(
-                    placeholder="Ask phantombox anything, or type / to run a command...",
+                    placeholder="Ask phantombox anything, or type /help for commands...",
                     id="dock-prompt",
                 )
                 with Horizontal(id="dock-box-footer"):
                     yield Label(f"● {format_model_display_name(self.model_name)}", id="dock-model-tag", classes="box-model-tag")
                     yield Label("", id="dock-context-tag", classes="box-context-tag")
                     yield Static(classes="box-footer-spacer")
-                    yield Label("Run /help for commands", classes="box-hint-tag")
+                    yield Label("enter send · shift+enter newline · ↑↓ history", classes="box-hint-tag")
 
     def on_mount(self) -> None:
         self._apply_border_color(self.theme_color)
         self._update_status_model()
+        self._apply_hero()
         self.query_one("#welcome-prompt", PromptArea).focus()
         # Hot-load cloud provider model catalogs right when the chat opens so
         # /models shows the full list immediately. Previously the catalogs were
-        # only fetched after re-saving an API key in /mcp --connect, so a fresh
+        # only fetched after re-saving an API key in /providers --connect, so a fresh
         # chat session showed a tiny models list until keys were re-entered.
         self._warm_provider_model_cache()
+        # Connect configured MCP tool servers in the background so their tools are
+        # merged into the first request without delaying the UI.
+        self._connect_mcp_servers()
 
     def _warm_provider_model_cache(self) -> None:
         """Pre-fetch model catalogs from every connected provider at chat startup.
 
         Fills the in-memory model cache so /models lists full catalogs immediately,
-        without requiring the user to re-save API keys via /mcp --connect.
+        without requiring the user to re-save API keys via /providers --connect.
         """
         try:
             for pid in list_connected_providers():
@@ -1364,12 +1645,112 @@ class PhantomChat(App):
             # Never block chat startup over catalog warm-up failures
             pass
 
+    def _connect_mcp_servers(self) -> None:
+        """Connect every configured MCP server exactly once, off the UI thread.
+
+        Each connection spawns a process / opens a socket, so it must never run on
+        the Textual event loop. The manager skips already-connected servers, so
+        calling this repeatedly (e.g. re-entering the chat view) is cheap. Failures
+        are silent here (surfaced by /mcp list).
+        """
+        try:
+            from phantombox.mcp import list_mcp_servers, get_mcp_manager
+
+            if not list_mcp_servers():
+                return
+            mgr = get_mcp_manager()
+            if getattr(mgr, "_connect_thread", None) is not None and mgr._connect_thread.is_alive():
+                return  # a warm-up pass is already running
+            def _warm():
+                try:
+                    mgr.connect_all()
+                except Exception:
+                    pass
+                finally:
+                    mgr._connect_thread = None
+            t = threading.Thread(target=_warm, name="phantombox-mcp-connect", daemon=True)
+            mgr._connect_thread = t
+            t.start()
+        except Exception:
+            pass
+
+    def _apply_hero(self) -> None:
+        """Keep the animated wordmark legible on the current terminal width.
+
+        The logo's own animation is handled by HeroLogo. This only decides whether
+        the full block art fits: terminals too narrow for it get the plain
+        text fallback instead of a clipped / wrapped mark.
+        """
+        try:
+            width = self.size.width
+        except Exception:
+            width = 0
+        if not width:
+            try:
+                width = self.app.size.width
+            except Exception:
+                width = 0
+        if not width:
+            import shutil as _shutil
+            width = _shutil.get_terminal_size((100, 30)).columns
+
+        try:
+            hero = self.query_one("#hero-banner", HeroLogo)
+        except Exception:
+            return
+        if width >= branding.LOGO_MIN_WIDTH and branding.supports_blocks_lenient():
+            hero.show_animation()
+        else:
+            hero.show_plain()
+
+    def on_resize(self, event: events.Resize) -> None:
+        """Re-check whether the animated logo fits when the terminal is resized."""
+        if self.in_welcome_mode:
+            self._apply_hero()
+
+    async def on_suggestion_chip_selected(self, event: SuggestionChip.Selected) -> None:
+        """A starter chip was clicked or activated: send its prompt."""
+        prompt = (event.prompt or "").strip()
+        if not prompt:
+            return
+        self._switch_to_chat()
+        self._record_history(prompt)
+        await self._send_user_message(prompt)
+
+    def _record_history(self, text: str) -> None:
+        """Push a sent message onto both prompt boxes' ↑/↓ history."""
+        entry = (text or "").strip()
+        if not entry:
+            return
+        history = getattr(self, "_prompt_history", None)
+        if history is None:
+            history = self._prompt_history = []
+        if not history or history[-1] != entry:
+            history.append(entry)
+        del history[:-100]  # keep the most recent 100 messages
+        for selector in ("#welcome-prompt", "#dock-prompt"):
+            try:
+                self.query_one(selector, PromptArea).set_history(history)
+            except Exception:
+                pass
+
     def _apply_border_color(self, hex_or_name: str) -> None:
-        """Dynamically set the border color on both prompt cards and model tags."""
+        """Paint the prompt-box *border* and the selected-model tag.
+
+        The inside of the box stays dark; /color <c> only swaps the accent that
+        outlines it (and tints the model tag in the footer and the hero logo).
+        """
+        self.theme_color = hex_or_name
         for card_id in ("#welcome-prompt-card", "#dock-prompt-card"):
             try:
                 card = self.query_one(card_id)
                 card.styles.border = ("round", hex_or_name)
+            except Exception:
+                pass
+
+        for footer_id in ("#welcome-box-footer", "#dock-box-footer"):
+            try:
+                self.query_one(footer_id).styles.background = "#0d1117"
             except Exception:
                 pass
 
@@ -1380,17 +1761,133 @@ class PhantomChat(App):
             except Exception:
                 pass
 
+        try:
+            self.query_one("#hero-banner", HeroLogo).set_color(hex_or_name)
+        except Exception:
+            pass
+
     def _switch_to_chat(self) -> None:
-        """Switch view from centered welcome banner to the active chat log."""
+        """Switch view from centered welcome banner to the active chat log.
+
+        Any text typed into the welcome prompt is carried into the docked prompt,
+        so the box the user is looking at keeps its content and its size (the
+        docked card intentionally mirrors the welcome card's styling).
+        """
         if self.in_welcome_mode:
+            welcome_prompt = self.query_one("#welcome-prompt", PromptArea)
+            dock_prompt = self.query_one("#dock-prompt", PromptArea)
+            draft = welcome_prompt.text
+
             self.query_one("#welcome-container").styles.display = "none"
             self.query_one("#chat-view").styles.display = "block"
             self.query_one("#dock-container").styles.display = "block"
             self.in_welcome_mode = False
-            self.query_one("#dock-prompt", PromptArea).focus()
+
+            # The hero is gone; stop its frame timer instead of animating
+            # a hidden widget for the rest of the session.
+            try:
+                self.query_one("#hero-banner", HeroLogo).stop()
+            except Exception:
+                pass
+
+            dock_prompt.set_history(self._prompt_history)
+            # Match sizes before moving focus so the box never visibly jumps: the
+            # docked card is the same height as the welcome card the user just
+            # typed in (see PromptArea.MIN_LINES).
+            dock_prompt.styles.height = welcome_prompt.styles.height
+            dock_prompt.load_text(draft)
+            dock_prompt.move_cursor(dock_prompt.document.end)
+            dock_prompt.focus()
+
+    def _get_router_mode_suffix(self) -> str:
+        """Effective routing mode suffix for the model tag, e.g. '/shuffle'.
+
+        Priority matches the routing engine: overdrive > provider > shuffle.
+        Exclusions are passive filtering and don't change the suffix, but are
+        surfaced in /phantombox --routes * --status output.
+        Returns '' when no special mode is engaged (plain adaptive routing).
+        """
+        if self.model_name not in ("phantombox/router", "router", "phantombox/subagents", "subagents"):
+            return ""
+        try:
+            from phantombox.router import get_overdrive_model, get_provider_filter, is_shuffle_mode
+            od = get_overdrive_model()
+            if od:
+                return "/overdrive"
+            pf = get_provider_filter()
+            if pf:
+                return f"/{pf}"
+            if is_shuffle_mode():
+                return "/shuffle"
+        except Exception:
+            pass
+        return ""
+
+    def _tools_for_active_model(self) -> List[Dict[str, Any]]:
+        """Tool schemas to send this turn, scoped to the active model's provider.
+
+        The rule is: **built-in PhantomBox tools + the tools reachable from this
+        model's provider**, and nothing else.
+
+        * ``phantombox/router`` -> the full pool, because the router re-pools per
+          route before dispatch (see stream_router_completion).
+        * a cloud model -> PhantomBox built-ins. Cloud APIs do not publish a tool
+          catalog of their own; what a hosted model can call is decided by the
+          ``tools`` array the client sends, so extra capabilities are exposed by
+          attaching MCP servers (/mcp add, /mcp add-http) rather than by having a
+          key. Tools from another provider's MCP servers never leak through.
+        * a model known to reject tools -> empty list, with a notice.
+        """
+        from phantombox.capabilities import supports_tools
+        from phantombox.providers import _model_tool_source, _tools_for_source, parse_model_identifier
+
+        self._tools_disabled_notice_pending = False
+        try:
+            p_info, raw_model = parse_model_identifier(self.model_name)
+            source = _model_tool_source(self.model_name)
+            if p_info and p_info.get("api_type") == "router":
+                return get_tool_definitions()
+            scoped = _tools_for_source(source, get_tool_definitions(), raw_model or self.model_name)
+            if not scoped:
+                self._tools_disabled_notice_pending = True
+            return scoped
+        except Exception:
+            pass
+        return get_tool_definitions()
+
+    def _tool_prep_label(self) -> str:
+        """Human-readable status for the tool-preparation phase of a turn.
+
+        Shows WHAT is happening (cache read vs. MCP warm-up in progress) so a
+        slow first message never looks like a frozen app.
+        """
+        try:
+            from phantombox.mcp import get_mcp_manager
+            mgr = get_mcp_manager()
+            servers = mgr.servers_config()
+            if not servers:
+                return "Preparing tools…"
+            ready = [n for n, c in mgr.connections.items() if c.status == "ready"]
+            ct = getattr(mgr, "_connect_thread", None)
+            connecting = [n for n in servers if n not in ready]
+            if ct is not None and ct.is_alive():
+                return f"Connecting MCP servers… ({len(ready)}/{len(servers)} ready)"
+            n_tools = len(mgr.tool_definitions())
+            if connecting and (not ready or not n_tools):
+                return f"Loading MCP servers… ({len(ready)}/{len(servers)} ready)"
+            if connecting:
+                return f"Preparing tools… ({len(ready)}/{len(servers)} MCP servers ready, {n_tools} tool(s) cached)"
+            return f"Preparing tools… ({n_tools} MCP tool(s) cached)"
+        except Exception:
+            return "Preparing tools…"
 
     def _update_status_model(self) -> None:
-        display_name = format_model_display_name(self.model_name)
+        display_name = format_model_display_name(self.model_name) + self._get_router_mode_suffix()
+        # Remote sessions show the host address right before the model name,
+        # so the user always knows which network they are chatting on.
+        sess = self.remote_session or None
+        if sess:
+            display_name = f"[cyan]@ {sess.get('host')}:{sess.get('port')}[/cyan] {display_name}"
         ctx_info = get_context_marker_info(self.messages, self.model_name)
 
         for selector in ("#welcome-model-tag", "#dock-model-tag"):
@@ -1411,11 +1908,111 @@ class PhantomChat(App):
             except Exception:
                 pass
 
+    def _is_remote_session(self) -> bool:
+        """True when this client is signed into a remote PhantomBox host.
+
+        While active, everything host-side is read-only: users can only switch
+        models, interact with them and search routes. Settings, MCP servers,
+        provider keys, server user management etc. are blocked.
+        """
+        return bool(self.remote_session)
+
+    def _remote_block_message(self) -> str:
+        sess = self.remote_session or {}
+        return (
+            f"[bold red]Read-only mode:[/bold red] You are signed into host [cyan]{sess.get('host')}:{sess.get('port')}[/cyan]. "
+            "Remote connections cannot change host settings, add MCP servers or manage users. "
+            "You can only switch models, chat with them and search routes. "
+            "Sign out with [cyan]/server sign-out[/cyan] to unlock this device."
+        )
+
+    def _remote_blocks_command(self, cmd_line: str) -> bool:
+        """Check if this slash command is blocked during a remote session.
+
+        '/phantombox' route-search stays open; '/server' is allowed for the
+        sign-out + status + scan paths only (the handler gates the rest).
+        """
+        if not self._is_remote_session():
+            return False
+        parts = cmd_line.split()
+        if not parts:
+            return False
+        cmd = parts[0].lower()
+        if cmd == "/phantombox":
+            return False  # route search is open to remote users
+        if cmd == "/server":
+            subcmd = parts[1].lower() if len(parts) > 1 else ""
+            return subcmd not in ("sign-out", "signout", "status", "scan", "--discover", "discover", "")
+        if cmd in ("/mcp", "/providers", "/subagents", "/color", "/runtime", "/setup", "/settings"):
+            return True
+        return False
+
     async def _add_system_message(self, text: str) -> None:
         chat_view = self.query_one("#chat-view")
         msg = ChatMessage("System", text, "system")
         await chat_view.mount(msg)
         chat_view.scroll_end(animate=False)
+
+    async def _start_status(self, label: str, color: str = "#38bdf8") -> "SpinnerThinking | None":
+        """Mount a labelled spinner and return it (None if the view is unavailable).
+
+        Callers must remove it in a finally block; a spinner left behind keeps
+        animating and leaves the user stuck on a long operation.
+        """
+        try:
+            chat_view = self.query_one("#chat-view", VerticalScroll)
+            spinner = SpinnerThinking(color=color, label_text=label)
+            await chat_view.mount(spinner)
+            chat_view.scroll_end(animate=False)
+            return spinner
+        except Exception:
+            return None
+
+    @staticmethod
+    async def _stop_status(spinner) -> None:
+        if spinner is None:
+            return
+        try:
+            await spinner.remove()
+        except Exception:
+            pass
+
+    async def _confirm_yes_no(self, question: str) -> bool:
+        """Ask a y/n question in the chat log and wait for the answer.
+
+        The typed answer is consumed here (see on_prompt_submitted's
+        _pending_confirmation branch), so it never reaches the model.
+        """
+        await self._add_system_message(question)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str] = loop.create_future()
+        self._pending_confirmation = future
+        try:
+            answer = (await future).strip().lower()
+        finally:
+            self._pending_confirmation = None
+        return answer in ("y", "yes")
+
+    async def _ask_input(self, prompt: str, default: str = "") -> str:
+        """Ask the user for free text in the chat log and return the typed value.
+
+        Uses the same pending-confirmation channel as _confirm_yes_no, so the
+        answer is consumed by the interactive flow and never reaches the model.
+        Returns the empty string when the user types nothing (or presses enter on
+        an empty box with no default).
+        """
+        suffix = f" [dim](default: {default})[/dim]" if default else ""
+        await self._add_system_message(prompt + suffix)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str] = loop.create_future()
+        self._pending_confirmation = future
+        try:
+            answer = (await future).strip()
+        except asyncio.CancelledError:
+            answer = ""
+        finally:
+            self._pending_confirmation = None
+        return answer or default
 
     async def _add_tool_message(self, title: str, text: str) -> None:
         chat_view = self.query_one("#chat-view")
@@ -1451,6 +2048,10 @@ class PhantomChat(App):
         raw_text = event.value.strip()
         if not raw_text:
             return
+
+        # Slash commands are recalled with ↑/↓ just like chat messages.
+        if raw_text.startswith("/"):
+            self._record_history(raw_text)
 
         # Check for /stop immediately
         if raw_text.lower() in ("/stop", "/cancel", "/abort"):
@@ -1488,6 +2089,21 @@ class PhantomChat(App):
         if not parts:
             return
         cmd = parts[0].lower()
+
+        # Remote-session gate: everything host-side is read-only while signed
+        # into another host. Route search (/phantombox) and sign-out stay open.
+        if self._remote_blocks_command(cmd_line):
+            await self._add_system_message(self._remote_block_message())
+            return
+
+        # /mcp list can block on a y/n confirmation. Run it as a background task
+        # so the UI, the prompt box and every other command keep working while
+        # the user decides -- awaiting it here froze the whole app behind the
+        # prompt ("it prints the message but nothing works after").
+        if cmd == "/mcp" and len(parts) > 1 and parts[1].lower() in ("list", "--list", "ls"):
+            self._switch_to_chat()
+            self.run_worker(self._handle_mcp_command(parts[1:], " ".join(parts[1:])), exclusive=False)
+            return
         args = parts[1:]
         raw_arg = cmd_line[len(parts[0]):].strip()
 
@@ -1514,7 +2130,11 @@ class PhantomChat(App):
             await self._handle_thinking_toggle(raw_arg)
             return
 
-        if cmd in ("/mcp", "/provider", "/providers"):
+        if cmd in ("/providers", "/provider"):
+            await self._handle_providers_command(args, raw_arg)
+            return
+
+        if cmd == "/mcp":
             await self._handle_mcp_command(args, raw_arg)
             return
 
@@ -1569,7 +2189,7 @@ class PhantomChat(App):
                 else:
                     await self._switch_to_model(raw_arg)
             else:
-                self._open_models_picker()
+                await self._open_models_picker_async()
             return
 
         if cmd in ("/clear", "/new"):
@@ -1599,20 +2219,30 @@ class PhantomChat(App):
                 "  • /settings mode <restricted|custom|full_access> - Set permission mode\n"
                 "  • /settings read <path|*> - Set allowed folder/file scope inside phantombox-dir\n"
                 "  • /settings write <path|*> - Set allowed folder/file scope inside phantombox-dir\n"
+                "  • /providers --connect - Connect cloud model provider API keys (OpenRouter, Groq, Claude...)\n"
+                "  • /providers list - List connected providers, key status & model counts\n"
+                "  • /providers --refresh - Re-fetch model catalogs now (bypasses the 24h cache)\n"
+                "  • /mcp - Connect external MCP tool servers (stdio or HTTP)\n"
+                "  • /mcp list - Show MCP servers, their tools, and which models can call them\n"
+                "  • /mcp --tools <provider> - Tools a provider's models can call\n"
+                "  • /mcp --models <provider> - A provider's models and their tool support\n"
                 "  • /user <name> - Set user name for this session\n"
                 "  • /user --color <color> - Set user display name color (e.g. /user --color cyan)\n"
                 "  • /user --global <name> - Save user name permanently across sessions\n"
                 "  • /assistant <name> - Set assistant name for this session\n"
                 "  • /assistant --color <color> - Set assistant display name color\n"
                 "  • /color <color> - Change prompt border color\n"
-                "  • /server - View server status, configured users & discovery settings\n"
+                "  • /server - View server status, users & signup auth mode\n"
                 "  • /server start [port] - Start LAN AI server on this device\n"
                 "  • /server close (or /server stop) - Close and stop LAN server\n"
-                "  • /server user <name> <password> <all|regular|use-only> - Create user with privilege\n"
-                "  • /server users - List users and assigned privilege levels\n"
+                "  • /server scan - Scan the network for other PhantomBox servers (shows device type)\n"
+                "  • /server --connect <host:port> - Connect to another server (interactive sign-in)\n"
+                "  • /server sign-out - End the remote session (returns to normal mode)\n"
+                "  • /server config <open|approval|email> - Set signup auth mode for this host\n"
+                "  • /server user <name> <password> - Create user (host-side, approved immediately)\n"
+                "  • /server user --approvals - View & approve/deny pending signups\n"
+                "  • /server users - List approved users and pending signups\n"
                 "  • /server discoverable <on|off> - Set broadcast discovery for phones/laptops\n"
-                "  • /server --discover - Scan LAN/hotspot for other PhantomBox servers\n"
-                "  • /server --connect <host:port> [user] [pass] - Connect to another server\n"
                 "  • /server remotes - List connected remote servers\n"
                 "  • /subagents - Manage subagents & automated helpers\n"
                 "  • /subagents --help - Detailed subagents commands\n"
@@ -1624,8 +2254,11 @@ class PhantomChat(App):
                 "  • /subagents auto [nickname] - Assign helper subagent to current session\n"
                 "  • /chat save [name] - Save current conversation to session file\n"
                 "  • /chat restore - Interactive session picker (press 'd' on any session to delete)\n"
-                "  • /phantombox --routes - Show every cloud model returning 200 OK (fastest first)\n"
+                "  • /phantombox --routes - Show every cloud model returning 200 OK\n"
                 "  • /phantombox --routes rescan - Re-ping all cloud models now and rebuild verified routes\n"
+                "  • /phantombox --routes rescan <provider> - Quick rescan of a single provider's routes\n"
+                "  • /phantombox --routes exclude|include|shuffle|overdrive|provider - Advanced route controls\n"
+                "  • /phantombox --routes --status - Show routing mode states & current prompt tag\n"
                 "  • /phantombox --router - View Smart Router status, settings & verified routes\n"
                 "  • /clear - Reset conversation\n"
                 "  • /exit - Exit chat"
@@ -1718,26 +2351,96 @@ class PhantomChat(App):
         status_text = "[bold green]enabled[/bold green]" if target_val else "[bold red]disabled[/bold red]"
         await self._add_system_message(f"Model thinking / deep reasoning mode is now {status_text}.")
 
-    async def _handle_mcp_command(self, args: list[str], raw_arg: str) -> None:
+    async def _handle_providers_command(self, args: list[str], raw_arg: str) -> None:
+        """Handle /providers — cloud LLM provider keys & model catalogs ('/mcp --connect' alias)."""
         self._switch_to_chat()
         if not args or args[0].lower() in ("--connect", "-c", "connect", "gui", "modal"):
             self._open_mcp_modal()
             return
 
         subcmd = args[0].lower()
+        if subcmd in ("--refresh", "refresh", "reload"):
+            from phantombox.providers import invalidate_catalog, fetch_provider_models, list_connected_providers as _lcp
+            invalidate_catalog()
+            pids = [p for p in _lcp() if p != "phantombox"]
+            if not pids:
+                await self._add_system_message("[yellow]No providers connected — nothing to refresh.[/yellow]")
+                return
+            await self._add_system_message(f"[dim]Refreshing model catalogs for {len(pids)} provider(s)…[/dim]")
+            results = await asyncio.gather(*(fetch_provider_models(p, force=True) for p in pids), return_exceptions=True)
+            ok = sum(1 for r in results if isinstance(r, list) and r)
+            await self._add_system_message(
+                f"[green]Catalog refresh complete:[/green] {ok}/{len(pids)} provider(s) returned models."
+                + (" [yellow]The rest failed — check keys/network.[/yellow]" if ok < len(pids) else "")
+            )
+            return
+
         if subcmd == "list":
-            connected = list_connected_providers()
+            connected = [p for p in list_connected_providers() if p != "phantombox"]
             if not connected:
                 await self._add_system_message(
-                    "No external providers connected yet.\nUse [cyan]/mcp --connect[/cyan] to connect OpenRouter, Groq, Claude, OpenAI, Gemini, Qwen, etc."
+                    "No external providers connected yet.\n"
+                    "Use [cyan]/providers --connect[/cyan] to connect OpenRouter, Groq, Claude, OpenAI, Gemini, NVIDIA, etc.\n\n"
+                    "[dim]Cloud providers supply chat models only; the tools given to them are PhantomBox's own. "
+                    "For external tool servers use [cyan]/mcp[/cyan].[/dim]"
                 )
             else:
-                lines = ["[bold]Connected External Providers:[/bold]"]
+                from phantombox.providers import catalog_cache_age, CATALOG_TTL_SECONDS
+                from phantombox.router import get_verified_models
+
+                routes = get_verified_models()
+                route_counts: Dict[str, int] = {}
+                for v in routes:
+                    rp = (v.get("provider") or "").lower()
+                    route_counts[rp] = route_counts.get(rp, 0) + 1
+
+                lines = ["[bold]Connected Providers (models only)[/bold]"]
                 for pid in connected:
                     p = get_provider(pid)
                     p_name = p["name"] if p else pid
-                    lines.append(f"  • [green]●[/green] {p_name} ([dim]{pid}[/dim])")
-                lines.append("\nSwitch models using [cyan]/models[/cyan].")
+                    key = get_provider_key(pid)
+                    key_state = "[green]key set[/green]" if key else "[yellow]no key[/yellow]"
+
+                    models = fetch_cached_or_default_models(pid)
+                    age = catalog_cache_age(pid)
+                    if not models:
+                        model_state = "[yellow]0 models (catalog unavailable)[/yellow]"
+                    elif age is None:
+                        model_state = f"{len(models)} model(s)"
+                    else:
+                        age_txt = f"{int(age // 3600)}h" if age >= 3600 else f"{int(age // 60)}m"
+                        expiry = "" if age <= CATALOG_TTL_SECONDS else " [yellow](stale)[/yellow]"
+                        model_state = f"{len(models)} model(s), cached {age_txt} ago{expiry}"
+
+                    n_routes = route_counts.get(pid.lower(), 0)
+                    route_state = (
+                        f"[green]{n_routes} verified route(s)[/green]" if n_routes
+                        else "[dim]no verified routes (run /phantombox --routes rescan)[/dim]"
+                    )
+
+                    # Tool support is a property of the *models*, so report it
+                    # truthfully rather than claiming the provider supplies tools.
+                    from phantombox.capabilities import supports_tools
+                    capable = sum(1 for m in models if supports_tools(pid, m) is True)
+                    incapable = sum(1 for m in models if supports_tools(pid, m) is False)
+                    if not models:
+                        tools_state = "[dim]n/a[/dim]"
+                    elif incapable == 0:
+                        tools_state = f"[dim]{capable}/{len(models)} models accept tools (local[/dim] [dim]tools)[/dim]"
+                    else:
+                        tools_state = f"[dim]{capable}/{len(models)} models accept tools, {incapable} cannot[/dim]"
+
+                    lines.append(f"  • [green]●[/green] [bold]{p_name}[/bold] ([dim]{pid}[/dim])")
+                    lines.append(f"      key: {key_state}  •  catalog: {model_state}")
+                    lines.append(f"      routes: {route_state}  •  {tools_state}")
+
+                lines.append(
+                    "\n[dim]Per provider: 'models' are the live catalog from that provider; 'routes' are the models "
+                    "that answered a 200 OK probe; 'accept tools' is how many of its models can call tools. "
+                    "All tool execution is local to PhantomBox. "
+                    "External tool servers are added with [cyan]/mcp add[/cyan].[/dim]"
+                )
+                lines.append("Switch models using [cyan]/models[/cyan].")
                 await self._add_system_message("\n".join(lines))
             return
 
@@ -1748,6 +2451,368 @@ class PhantomChat(App):
             return
 
         self._open_mcp_modal()
+
+    def _warn_if_no_tools(self, server_name: str) -> None:
+        """Nothing to say when tools are present; otherwise keep it quiet too.
+
+        Kept as a hook so a later change can flag zero-tool servers without
+        touching the add flow.
+        """
+        return
+
+    def _mcp_tool_pool_rows(self) -> list[str]:
+        """Per MCP server: its tools and which connected models can call them."""
+        from phantombox.mcp import get_mcp_manager
+
+        mgr = get_mcp_manager()
+        capable = [(mid, label) for mid, label, can in self._models_supporting_tools() if can]
+        rows: list[str] = []
+        for name in mgr.connections:
+            tools = mgr.get_tools(name)
+            if not tools:
+                continue
+            rows.append(f"  • [bold]{name}[/bold] — {len(tools)} tool(s)")
+            if capable:
+                shown = ", ".join(label for _mid, label in capable[:4])
+                more = f" (+{len(capable) - 4} more)" if len(capable) > 4 else ""
+                rows.append(f"      [green]usable by {len(capable)} model(s):[/green] {shown}{more}")
+            else:
+                rows.append("      [yellow]no tool-capable models available[/yellow]")
+        return rows
+
+    def _model_tool_pool_rows(self) -> list[str]:
+        """Per connected model: which tool sources it receives.
+
+        This is the inverse view of _mcp_tool_pool_rows and answers "what does the
+        selected model actually see when it runs a turn?".
+        """
+        from phantombox.mcp import get_mcp_manager
+        from phantombox.tools import get_tool_definitions
+
+        mgr = get_mcp_manager()
+        n_builtin = len([t for t in get_tool_definitions() if "__" not in t["function"]["name"]])
+        mcp_servers = [s for s in mgr.connections if mgr.get_tools(s)]
+
+        rows: list[str] = []
+        for model_id, label, can in self._models_supporting_tools():
+            if not can:
+                rows.append(f"  • {label} [red]— no function calling (built-ins unavailable)[/red]")
+                continue
+            sources = f"{n_builtin} built-in"
+            if mcp_servers:
+                sources += f" + MCP ({', '.join(mcp_servers)})"
+            rows.append(f"  • {label} [green]← {sources}[/green]")
+        return rows
+
+    def _models_supporting_tools(self) -> list[tuple[str, str, bool]]:
+        """Every selectable model plus whether it can call tools."""
+        from phantombox.capabilities import tools_supported_or_unknown
+        from phantombox.providers import parse_model_identifier
+
+        out: list[tuple[str, str, bool]] = []
+        for model_id, label, _ok in self._get_all_available_models():
+            p_info, raw = parse_model_identifier(model_id)
+            if p_info and p_info.get("api_type") == "router":
+                can = True  # router forwards to whichever route wins
+            else:
+                can = tools_supported_or_unknown((p_info or {}).get("id", ""), raw or model_id)
+            out.append((model_id, label, can))
+        return out
+
+    async def _handle_mcp_command(self, args: list[str], raw_arg: str) -> None:
+        """Handle /mcp — external MCP tool servers and which models can use them."""
+        from phantombox.mcp import list_mcp_servers
+
+        self._switch_to_chat()
+        servers = list_mcp_servers()
+        subcmd = args[0].lower() if args else ""
+
+        # ---- /mcp --tools provider --list / /mcp --tools --list ----
+        # (accepts both spellings; the provider slot may be omitted)
+        if subcmd in ("--tools", "tools", "--models", "models"):
+            from phantombox.providers import list_connected_providers, get_provider
+
+            target = None
+            for a in args[1:]:
+                if a.lower() not in ("--list", "list", "--ls", "--status", "status"):
+                    target = a
+                    break
+            wants_list = any(a.lower() in ("--list", "list", "--ls") for a in args[1:])
+            connected = [p for p in list_connected_providers() if p != "phantombox"]
+
+            if wants_list or not target:
+                lines = ["[bold cyan]Connected providers:[/bold cyan]"]
+                if not connected:
+                    lines.append("  [dim](none — connect one with /providers --connect)[/dim]")
+                for pid in connected:
+                    info = get_provider(pid) or {}
+                    n_models = len(fetch_cached_or_default_models(pid))
+                    lines.append(f"  • [bold]{pid}[/bold] ({info.get('name', pid)}) — {n_models} model(s)")
+                lines.append(
+                    "\n[dim]/mcp --tools <provider> — tools that provider's models can call\n"
+                    "/mcp --models <provider> — that provider's models and tool support[/dim]"
+                )
+                await self._add_system_message("\n".join(lines))
+                return
+
+            from phantombox.router import _resolve_connected_provider
+
+            resolved = _resolve_connected_provider(target)
+            if not resolved:
+                await self._add_system_message(
+                    f"[yellow]'{target}' is not a connected provider.[/yellow] "
+                    f"Connected: {', '.join(connected) if connected else 'none'}.\n"
+                    "[dim]Run [cyan]/mcp --tools --list[/cyan] to see the exact names.[/dim]"
+                )
+                return
+
+            # Provider resolution may live-probe the endpoint (set_provider_filter
+            # does), and get_tool_definitions() connects MCP servers, so both the
+            # lookup and the listing get a visible spinner instead of a frozen box.
+            spinner = await self._start_status("Listing…")
+            try:
+                models = await asyncio.to_thread(fetch_cached_or_default_models, resolved)
+                info = get_provider(resolved) or {}
+            finally:
+                await self._stop_status(spinner)
+
+            if subcmd in ("--models", "models"):
+                lines = [f"[bold cyan]{info.get('name', resolved)} models ({len(models)}):[/bold cyan]"]
+                if not models:
+                    lines.append("  [dim](no catalog — run /providers --refresh)[/dim]")
+                for mid in models:
+                    from phantombox.capabilities import tool_capability_label
+                    cap = tool_capability_label(resolved, mid)
+                    colour = "green" if cap == "tools: yes" else ("red" if cap == "tools: no" else "yellow")
+                    lines.append(f"  • [bold]{mid}[/bold] [{colour}]{cap}[/{colour}]")
+                lines.append(
+                    "\n[dim]Models marked 'tools: no' only get PhantomBox built-in tools when they\n"
+                    "support them; the rest receive built-ins + every connected MCP tool.[/dim]"
+                )
+                await self._add_system_message("\n".join(lines))
+                return
+
+            # ---- /mcp --tools <provider> ----
+            # Shows EXACTLY what a model of this provider receives on a turn:
+            # PhantomBox built-ins + the MCP tools attached to this app. Cloud
+            # providers do not publish their own tool catalog, so an API key can
+            # never add tools by itself -- see the note printed at the end.
+            from phantombox.mcp import get_mcp_manager
+            from phantombox.capabilities import tools_supported_or_unknown
+            from phantombox.tools import get_tool_definitions
+
+            mgr = get_mcp_manager()
+            spinner = await self._start_status("Listing…")
+            try:
+                all_tools = await asyncio.to_thread(get_tool_definitions)
+                capable_models = [m for m in models if tools_supported_or_unknown(resolved, m)]
+            finally:
+                await self._stop_status(spinner)
+            lines = [
+                f"[bold cyan]Tools available to {info.get('name', resolved)} models[/bold cyan]",
+                f"[dim]source: PhantomBox built-ins + MCP servers attached to this app"
+                f" ({len(mgr.connections)} connected)[/dim]",
+            ]
+
+            all_tools = get_tool_definitions()
+            all_tools = get_tool_definitions()
+            builtin = [t for t in all_tools if "__" not in t["function"]["name"]]
+            lines.append(f"\n[bold]Built-in ({len(builtin)}):[/bold] " + ", ".join(
+                f"[cyan]{t['function']['name']}[/cyan]" for t in builtin
+            ))
+
+            if not mgr.connections:
+                lines.append("\n[bold]MCP:[/bold] [dim]none attached[/dim]")
+                lines.append(
+                    "\n[yellow]An API key does not add tools.[/yellow] Cloud providers only run "
+                    "the tools a client sends, so to give these models extra capabilities attach "
+                    "an MCP server (or a hosted/remote MCP endpoint) to PhantomBox:\n"
+                    "  [cyan]/mcp add github npx -y @modelcontextprotocol/server-github[/cyan]\n"
+                    "  [cyan]/mcp add-http hosted https://mcp.example.com/mcp <token>[/cyan]"
+                )
+            else:
+                lines.append("\n[bold]MCP servers:[/bold]")
+                for srv in mgr.connections:
+                    tools = mgr.get_tools(srv)
+                    if not tools:
+                        continue
+                    lines.append(f"  • [bold]{srv}[/bold] — {len(tools)} tool(s)")
+                    for t in tools:
+                        lines.append(f"      - [cyan]{t['qualified_name']}[/cyan] {t['description'][:70]}")
+
+            lines.append(f"\n[dim]{len(capable_models)}/{len(models)} models can call these tools."
+                         + ("" if capable_models else " This provider has no tool-capable model.")
+                         + "[/dim]")
+            await self._add_system_message("\n".join(lines))
+            return
+
+        # Legacy alias: /mcp with no args (or --connect) behaves as before.
+        if not args or args[0].lower() in ("--connect", "-c", "connect", "gui", "modal"):
+            if servers:
+                await self._add_system_message(
+                    f"[bold cyan]MCP servers connected ({len(servers)}):[/bold cyan]\n"
+                    + "\n".join(f"  • {n}" for n in servers)
+                    + "\n\n[dim]Add one with [cyan]/mcp add <name> <command...>[/cyan] or [cyan]/mcp add-http <name> <url>[/cyan]. "
+                    "For cloud model API keys use [cyan]/providers --connect[/cyan].[/dim]"
+                )
+            else:
+                await self._add_system_message(
+                    "[bold cyan]MCP — external tool servers[/bold cyan]\n"
+                    "No MCP servers connected yet.\n\n"
+                    "Connect one:\n"
+                    "  • [cyan]/mcp add <name> <command> [args...][/cyan] — stdio server (e.g. npx -y @modelcontextprotocol/server-filesystem <dir>)\n"
+                    "  • [cyan]/mcp add-http <name> <url> [bearer_token][/cyan] — Streamable HTTP server\n"
+                    "  • [cyan]/mcp list[/cyan] — show servers and the tools they expose\n"
+                    "  • [cyan]/mcp remove <name>[/cyan] — disconnect a server\n\n"
+                    "[dim]Cloud model API keys are managed separately with [cyan]/providers --connect[/cyan]."
+                    " MCP tools (e.g. github__create_issue) are merged into the model's tool list automatically.[/dim]"
+                )
+            return
+
+        if subcmd == "list":
+            if not servers:
+                await self._add_system_message(
+                    "No MCP servers configured. Add one with [cyan]/mcp add <name> <command...>[/cyan]."
+                )
+                return
+            from phantombox.mcp import get_mcp_manager
+            mgr = get_mcp_manager()
+
+            # A busy install can hold hundreds of models across providers; probing
+            # every catalog up front is slow, so warn first and let the user opt
+            # out. The count comes from cached catalogs (no network yet).
+            from phantombox.providers import list_connected_providers
+
+            connected = [p for p in list_connected_providers() if p != "phantombox"]
+            n_models = sum(len(fetch_cached_or_default_models(p)) for p in connected)
+            if n_models:
+                proceed = await self._confirm_yes_no(
+                    f"[bold yellow]Are you sure you want to list all models?[/bold yellow] "
+                    f"[bold]{n_models}[/bold] model(s) are available across {len(connected)} provider(s) "
+                    "and this might take a significant amount of time.\n"
+                    "Continue? Type [bold green]y[/bold green] / [bold green]yes[/bold green] to continue, "
+                    "[bold red]n[/bold red] / [bold red]no[/bold red] to cancel."
+                )
+                if not proceed:
+                    await self._add_system_message("[dim]Cancelled.[/dim]")
+                    return
+
+            spinner = await self._start_status("Listing…")
+            try:
+                await asyncio.to_thread(mgr.connect_all)
+            finally:
+                await self._stop_status(spinner)
+
+            lines = [f"[bold cyan]MCP Servers ({len(servers)}):[/bold cyan]"]
+            for name, spec in servers.items():
+                tools = mgr.get_tools(name)
+                conn = mgr.connections.get(name)
+                transport = spec.get("url") or " ".join([spec.get("command", "")] + list(spec.get("args", [])))
+
+                # Report real connection state, not just tool count: a server
+                # that failed to start and one that started but exposes nothing
+                # are different problems.
+                if conn is None:
+                    state = "[yellow]○ not connected[/yellow]"
+                elif conn.status == "error":
+                    state = f"[red]✗ failed[/red] [dim]{conn.error[:70]}[/dim]"
+                elif conn.status == "ready" and tools:
+                    state = f"[green]● ready — {len(tools)} tool(s)[/green]"
+                elif conn.status == "ready":
+                    state = "[yellow]○ connected, exposes 0 tools[/yellow]"
+                else:
+                    state = f"[yellow]○ {conn.status}[/yellow]"
+
+                lines.append(f"  • [bold]{name}[/bold] {state}")
+                lines.append(f"      [dim]{transport}[/dim]")
+                for t in tools:
+                    lines.append(f"      - [cyan]{t['qualified_name']}[/cyan] {t.get('description', '')[:80]}")
+            lines.append(
+                "\n[dim]Remove with /mcp remove <name>. Tools are namespaced server__tool and always ask "
+                "for confirmation unless allow-listed under mcp_auto_approve.[/dim]"
+            )
+
+            # Tools <-> models mapping: which models can actually call these tools,
+            # and what each connected model receives on a turn.
+            tool_rows = self._mcp_tool_pool_rows()
+            if tool_rows:
+                lines.append("\n[bold cyan]Tools by model access:[/bold cyan]")
+                lines.extend(tool_rows)
+
+            model_rows = self._model_tool_pool_rows()
+            if model_rows:
+                lines.append("\n[bold cyan]Model tool pools:[/bold cyan]")
+                lines.extend(model_rows)
+
+            lines.append(
+                "\n[dim]Per provider: [cyan]/mcp --tools <provider>[/cyan] · "
+                "[cyan]/mcp --models <provider>[/cyan] · "
+                "[cyan]/mcp --tools provider --list[/cyan][/dim]"
+            )
+            await self._add_system_message("\n".join(lines))
+            return
+
+        if subcmd in ("add", "add-http", "connect") and len(args) > 1:
+            from phantombox.mcp import add_mcp_server, probe_mcp_server, list_mcp_servers as _list_servers
+            name = args[1].lower()
+            if subcmd == "add-http":
+                if len(args) < 3:
+                    await self._add_system_message("Usage: [cyan]/mcp add-http <name> <url> [bearer_token][/cyan]")
+                    return
+                spec = {"url": args[2], "token": args[3] if len(args) > 3 else ""}
+            else:
+                if len(args) < 3:
+                    await self._add_system_message("Usage: [cyan]/mcp add <name> <command> [args...][/cyan]")
+                    return
+                spec = {"command": args[2], "args": list(args[3:])}
+
+            ok, msg = add_mcp_server(name, spec)
+            if not ok:
+                await self._add_system_message(f"[bold red]✗ Not added:[/bold red] {msg}")
+                return
+
+            # Saved first, then probed. The probe is what decides the final
+            # message, so "saved but the server never started" can no longer be
+            # reported as a plain success (that mismatch is why an error was
+            # followed by the server showing up in /mcp list).
+            spinner = await self._start_status("Adding MCP…")
+            try:
+                ok, msg = await asyncio.to_thread(probe_mcp_server, name)
+            finally:
+                await self._stop_status(spinner)
+
+            if ok:
+                await self._add_system_message(f"[bold green]✓ Added:[/bold green] {msg}")
+                self._warn_if_no_tools(name)
+            elif name in _list_servers():
+                await self._add_system_message(
+                    f"[bold yellow]⚠ Saved but not connected:[/bold yellow] {msg}\n"
+                    f"[dim]'{name}' is stored and will retry on first use. Fix the command, then run "
+                    f"[cyan]/mcp add {name} <command>[/cyan] again, or [cyan]/mcp remove {name}[/cyan] to discard it.[/dim]"
+                )
+            else:
+                await self._add_system_message(f"[bold red]✗ Not added:[/bold red] {msg}")
+            return
+
+        if subcmd in ("remove", "rm", "disconnect") and len(args) > 1:
+            from phantombox.mcp import remove_mcp_server
+            ok, msg = remove_mcp_server(args[1].lower())
+            style = "green" if ok else "yellow"
+            await self._add_system_message(f"[{style}]{msg}[/{style}]")
+            return
+
+        await self._add_system_message(
+            "[bold cyan]MCP commands[/bold cyan]\n"
+            "  • [cyan]/mcp[/cyan] — overview & help\n"
+            "  • [cyan]/mcp list[/cyan] — servers, their tools, and which models can call them\n"
+            "  • [cyan]/mcp --tools <provider>[/cyan] — tools a provider's models can call\n"
+            "  • [cyan]/mcp --tools provider --list[/cyan] — connected providers\n"
+            "  • [cyan]/mcp --models <provider>[/cyan] — a provider's models and tool support\n"
+            "  • [cyan]/mcp add <name> <command> [args...][/cyan] — stdio server\n"
+            "  • [cyan]/mcp add-http <name> <url> [token][/cyan] — Streamable HTTP server\n"
+            "  • [cyan]/mcp remove <name>[/cyan] — disconnect a server\n\n"
+            "[dim]Cloud provider API keys: [cyan]/providers --connect[/cyan][/dim]"
+        )
 
     def _open_mcp_modal(self) -> None:
         def on_closed(_) -> None:
@@ -1946,7 +3011,7 @@ class PhantomChat(App):
             )
 
     async def _handle_server_command(self, args: list[str], raw_arg: str) -> None:
-        """Handle /server commands (start, close, user, users, discoverable, --connect, --discover, remotes)."""
+        """Handle /server commands: start, close, scan, connect, config, user, users, sign-out, etc."""
         self._switch_to_chat()
         from phantombox.server import (
             start_server,
@@ -1955,6 +3020,10 @@ class PhantomChat(App):
             set_user,
             remove_user,
             list_users,
+            list_pending_users,
+            approve_user,
+            deny_user,
+            set_auth_mode,
             set_discoverable,
             is_discoverable,
             get_local_ip,
@@ -1963,6 +3032,9 @@ class PhantomChat(App):
             save_remote_server,
             list_remote_servers,
             remove_remote_server,
+            AUTH_MODE_OPEN,
+            AUTH_MODE_APPROVAL,
+            AUTH_MODE_EMAIL,
         )
 
         if not args:
@@ -1973,33 +3045,44 @@ class PhantomChat(App):
             local_ip = get_local_ip()
             users = list_users()
             disc = is_discoverable()
+            auth_mode = cfg.get("auth_mode", AUTH_MODE_OPEN)
 
             status_str = f"[bold green]ONLINE[/bold green] (listening on http://{local_ip}:{port})" if running else "[bold yellow]OFFLINE[/bold yellow]"
             disc_str = "[green]ENABLED[/green]" if disc else "[red]DISABLED[/red]"
+            mode_str = {
+                AUTH_MODE_OPEN: "[green]open[/green] (instant signup, credentials saved immediately)",
+                AUTH_MODE_APPROVAL: "[yellow]approval[/yellow] (new signups wait for your approval)",
+                AUTH_MODE_EMAIL: "[red]email[/red] (requires email verification — not supported yet)",
+            }.get(auth_mode, auth_mode)
 
             lines = [
-                f"[bold cyan]PhantomBox AI Server Architecture[/bold cyan]",
+                "[bold cyan]PhantomBox AI Server[/bold cyan]",
                 f"• Status: {status_str}",
                 f"• Local IP (Hotspot/LAN): [bold]{local_ip}[/bold] (Port: {port})",
                 f"• Network Discovery Beacon: {disc_str}",
-                f"• Configured Users ({len(users)}):",
+                f"• Signup auth mode: {mode_str}",
+                f"• Approved users ({len(users)}): [bold]{', '.join(users.keys()) or '(none)'}[/bold]",
+                f"• Pending signups ({len(list_pending_users())})",
             ]
-            if users:
-                for u, priv in users.items():
-                    priv_color = "red" if priv == "all" else ("yellow" if priv == "regular" else "blue")
-                    lines.append(f"    - [bold]{u}[/bold]: [{priv_color}]{priv}[/{priv_color}] privilege")
-            else:
-                lines.append("    [dim](No users configured. Add one with: /server user <name> <password> <privilege>)[/dim]")
+            if self._is_remote_session():
+                sess = self.remote_session or {}
+                lines.append(f"• [bold magenta]Remote session:[/bold magenta] signed in as {sess.get('username')} @ {sess.get('host')}:{sess.get('port')} [dim](read-only)[/dim]")
 
-            lines.append("\n[bold]Server Commands:[/bold]")
-            lines.append("  • [cyan]/server start [port][/cyan] - Open server for mobile/desktop connections")
-            lines.append("  • [cyan]/server close[/cyan] - Close and shutdown server")
-            lines.append("  • [cyan]/server user <name> <password> <all|regular|use-only>[/cyan] - Create/update user")
-            lines.append("  • [cyan]/server user rm <name>[/cyan] - Remove user")
-            lines.append("  • [cyan]/server discoverable <on|off>[/cyan] - Toggle phone discovery")
-            lines.append("  • [cyan]/server --discover[/cyan] - Find other servers on WiFi/Hotspot")
-            lines.append("  • [cyan]/server --connect <host:port> [user] [pass][/cyan] - Connect to another server")
-
+            lines += [
+                "\n[bold]Server Commands:[/bold]",
+                "  • [cyan]/server start [port][/cyan] - Open server for network connections",
+                "  • [cyan]/server close[/cyan] - Close and shutdown server",
+                "  • [cyan]/server scan[/cyan] - Scan LAN/hotspot for other PhantomBox servers (shows device type)",
+                "  • [cyan]/server --connect <host:port>[/cyan] - Connect to a server (interactive sign-in)",
+                "  • [cyan]/server sign-out[/cyan] - End the remote session on this device",
+                "  • [cyan]/server config[/cyan] - View or change signup auth mode (open|approval|email)",
+                "  • [cyan]/server user <name> <password>[/cyan] - Create/update a user (host-side)",
+                "  • [cyan]/server user rm <name>[/cyan] - Remove user",
+                "  • [cyan]/server user --approvals[/cyan] - View & approve/deny pending signups",
+                "  • [cyan]/server users[/cyan] - List approved users",
+                "  • [cyan]/server discoverable <on|off>[/cyan] - Toggle phone discovery",
+                "  • [cyan]/server remotes[/cyan] - List connected remote servers",
+            ]
             await self._add_system_message("\n".join(lines))
             return
 
@@ -2018,7 +3101,7 @@ class PhantomChat(App):
                 await self._add_system_message(
                     f"[bold green]Server started successfully![/bold green]\n"
                     f"Address: [bold cyan]http://{ip}:{p}[/bold cyan]\n"
-                    f"Mobile phones connected to this WiFi or Hotspot can now connect with authentication."
+                    f"Devices on this WiFi/Hotspot can now connect and sign in."
                 )
             else:
                 await self._add_system_message(f"[bold red]Failed to start server:[/bold red] {msg}")
@@ -2028,20 +3111,102 @@ class PhantomChat(App):
         if subcmd in ("close", "stop"):
             success, msg = stop_server()
             if success:
-                await self._add_system_message(f"[bold yellow]Server closed.[/bold yellow] Incoming connections stopped.")
+                await self._add_system_message("[bold yellow]Server closed.[/bold yellow] Incoming connections stopped.")
             else:
                 await self._add_system_message(f"[yellow]{msg}[/yellow]")
             return
 
-        # 3. /server user ...
+        # 3. /server scan — interactive network scan + connect flow
+        if subcmd in ("scan", "--discover", "discover", "-d"):
+            await self._run_server_scan_flow()
+            return
+
+        # 4. /server sign-out
+        if subcmd in ("sign-out", "signout", "logout"):
+            if not self._is_remote_session():
+                await self._add_system_message("You are not signed into any remote server.")
+                return
+            sess = self.remote_session or {}
+            self.remote_session = None
+            self._update_status_model()
+            await self._add_system_message(
+                f"[bold green]Signed out[/bold green] of {sess.get('host')}:{sess.get('port')} (user: {sess.get('username')}). "
+                "This device is back to normal mode."
+            )
+            return
+
+        # 5. /server config — host-side auth-mode setting
+        if subcmd == "config":
+            if len(args) > 1:
+                mode = args[1].lower().strip()
+                ok, msg = set_auth_mode(mode)
+                color = "green" if ok else "red"
+                await self._add_system_message(f"[{color}]{msg}[/{color}]")
+                if ok:
+                    desc = {
+                        AUTH_MODE_OPEN: "New users pick Sign up -> enter login + password (+ confirm) and are saved immediately, then asked to Sign In.",
+                        AUTH_MODE_APPROVAL: "New users pick Sign up -> credentials are stored in a pending queue. They can only sign in after you approve them with /server user --approvals.",
+                        AUTH_MODE_EMAIL: "Reserved for email verification. Signups will see: 'Feature is not available yet. Please contact support or the host for further validation'.",
+                    }.get(mode, "")
+                    if desc:
+                        await self._add_system_message(f"[dim]{desc}[/dim]")
+                return
+
+            cfg = get_server_config()
+            mode = cfg.get("auth_mode", AUTH_MODE_OPEN)
+            pending = list_pending_users()
+            lines = [
+                "[bold cyan]Server Auth Configuration[/bold cyan]",
+                f"• Signup auth mode: [bold]{mode}[/bold]",
+                f"• Pending signups awaiting approval: [bold]{len(pending)}[/bold]",
+                "\n[bold]Options:[/bold]",
+                "  • [green]open[/green]      - Anyone can sign up and use the server immediately",
+                "  • [yellow]approval[/yellow] - Signups wait for your approval (/server user --approvals)",
+                "  • [red]email[/red]       - Email verification (planned; currently blocks signups with a 'not available yet' message)",
+                "\nUsage: [cyan]/server config <open|approval|email>[/cyan]",
+            ]
+            await self._add_system_message("\n".join(lines))
+            return
+
+        # 6. /server user ... (host-side account management)
         if subcmd == "user":
             if len(args) == 1:
                 users = list_users()
-                lines = [f"[bold cyan]Server Users ({len(users)}):[/bold cyan]"]
-                for u, priv in users.items():
-                    lines.append(f"  • [bold]{u}[/bold] - Privilege: {priv}")
-                lines.append("\nUsage: /server user <name> <password> <all|regular|use-only>")
+                lines = [f"[bold cyan]Approved Users ({len(users)}):[/bold cyan]"]
+                for u in users:
+                    lines.append(f"  • [bold]{u}[/bold]")
+                lines.append("\nUsage: /server user <name> <password>  |  /server user rm <name>  |  /server user --approvals")
                 await self._add_system_message("\n".join(lines))
+                return
+
+            # /server user --approvals — view & manage pending signups
+            if args[1].lower() in ("--approvals", "approvals", "pending"):
+                pending = list_pending_users()
+                if not pending:
+                    await self._add_system_message("[green]No pending signups awaiting approval.[/green]")
+                    return
+                import time as _time
+                lines = [f"[bold yellow]Pending Signups ({len(pending)}):[/bold yellow]"]
+                for u, info in pending.items():
+                    ts = info.get("requested_at", 0)
+                    age = f" ({int((_time.time() - ts) // 60)} min ago)" if ts else ""
+                    lines.append(f"  • [bold]{u}[/bold]{age}")
+                lines.append("\nApprove with: [cyan]/server user approve <name>[/cyan]   Deny with: [cyan]/server user deny <name>[/cyan]")
+                await self._add_system_message("\n".join(lines))
+                return
+
+            if args[1].lower() in ("approve", "deny") and len(args) > 2:
+                target = args[2]
+                if args[1].lower() == "approve":
+                    if approve_user(target):
+                        await self._add_system_message(f"[bold green]User '[bold]{target}[/bold]' approved.[/bold green] They can now sign in to your server.")
+                    else:
+                        await self._add_system_message(f"[red]No pending signup found for '{target}'.[/red]")
+                else:
+                    if deny_user(target):
+                        await self._add_system_message(f"[bold yellow]Pending signup for '{target}' denied.[/bold yellow] They cannot sign in.")
+                    else:
+                        await self._add_system_message(f"[red]No pending signup found for '{target}'.[/red]")
                 return
 
             if args[1].lower() in ("rm", "delete", "remove") and len(args) > 2:
@@ -2055,39 +3220,31 @@ class PhantomChat(App):
             if len(args) >= 3:
                 u_name = args[1]
                 u_pw = args[2]
-                u_priv = args[3].lower() if len(args) > 3 else "regular"
-                if u_priv not in ("all", "regular", "use-only"):
-                    await self._add_system_message(
-                        f"[red]Invalid privilege '{u_priv}'.[/red] Options are: [bold]all[/bold], [bold]regular[/bold], or [bold]use-only[/bold]."
-                    )
-                    return
-
-                set_user(u_name, u_pw, u_priv)
-                priv_desc = {
-                    "all": "Full control (modify server config, manage users, runtime settings, full chat)",
-                    "regular": "Standard access (chat, scoped tools, custom UI settings, cannot modify server auth)",
-                    "use-only": "Interact only (chat with models only, zero modification to any settings)",
-                }
+                set_user(u_name, u_pw)
                 await self._add_system_message(
                     f"[bold green]User saved successfully![/bold green]\n"
                     f"• Username: [bold]{u_name}[/bold]\n"
-                    f"• Privilege: [bold cyan]{u_priv}[/bold cyan] ({priv_desc.get(u_priv, '')})"
+                    f"[dim](Host-created accounts are approved immediately; signup-mode rules apply only to self-service signups.)[/dim]"
                 )
                 return
 
-            await self._add_system_message("Usage: [cyan]/server user <username> <password> <all|regular|use-only>[/cyan]")
+            await self._add_system_message("Usage: [cyan]/server user <username> <password>[/cyan]  |  [cyan]/server user --approvals[/cyan]")
             return
 
-        # 4. /server users
+        # 7. /server users
         if subcmd == "users":
             users = list_users()
-            lines = [f"[bold cyan]Server Users ({len(users)}):[/bold cyan]"]
-            for u, priv in users.items():
-                lines.append(f"  • [bold]{u}[/bold] - Privilege: {priv}")
+            pending = list_pending_users()
+            lines = [f"[bold cyan]Approved Users ({len(users)}):[/bold cyan]"]
+            for u in users:
+                lines.append(f"  • [bold]{u}[/bold]")
+            if pending:
+                lines.append(f"\n[bold yellow]Pending approvals ({len(pending)}):[/bold yellow] " + ", ".join(pending.keys()))
+                lines.append("[dim]Review with /server user --approvals[/dim]")
             await self._add_system_message("\n".join(lines))
             return
 
-        # 5. /server discoverable <on|off>
+        # 8. /server discoverable <on|off>
         if subcmd in ("discoverable", "discovery"):
             if len(args) > 1:
                 opt = args[1].lower().strip()
@@ -2104,86 +3261,20 @@ class PhantomChat(App):
                 await self._add_system_message(f"Server discovery is currently: {'[green]ON[/green]' if cur else '[red]OFF[/red]'}")
             return
 
-        # 6. /server --discover (scan LAN for other PhantomBox servers)
-        if subcmd in ("--discover", "-d", "discover", "scan"):
-            await self._add_system_message("Scanning WiFi / Hotspot network for PhantomBox servers (UDP 8444)...")
-            found = discover_lan_servers(timeout_seconds=2.0)
-            if not found:
-                await self._add_system_message("No other PhantomBox servers detected on this network.")
-            else:
-                lines = [f"[bold green]Found {len(found)} server(s) on network:[/bold green]"]
-                for s in found:
-                    lines.append(f"  • [bold]{s.get('server_name')}[/bold] at [cyan]{s.get('url')}[/cyan] (IP: {s.get('ip')}:{s.get('port')})")
-                lines.append("\nConnect using: /server --connect <host:port> [user] [password]")
-                await self._add_system_message("\n".join(lines))
-            return
-
-        # 7. /server --connect <host[:port]> [username] [password]
+        # 9. /server --connect <host[:port]> [username] [password]
         if subcmd in ("--connect", "-c", "connect"):
-            if len(args) < 2:
-                remotes = list_remote_servers()
-                if not remotes:
-                    await self._add_system_message("Usage: [cyan]/server --connect <host:port> <username> <password> [server_name][/cyan]")
-                else:
-                    lines = ["[bold cyan]Connected Remote Servers:[/bold cyan]"]
-                    for name, info in remotes.items():
-                        lines.append(f"  • [bold]{name}[/bold] -> {info.get('url')} (User: {info.get('username')})")
-                    lines.append("\nUse models with: [cyan]/models[/cyan] or type [cyan]/models server/<name>/<model>[/cyan]")
-                    await self._add_system_message("\n".join(lines))
-                return
-
-            target = args[1].replace("http://", "").replace("https://", "")
-            if ":" in target:
-                host, port_str = target.split(":", 1)
-                port = int(port_str) if port_str.isdigit() else 8443
-            else:
-                host = target
-                port = 8443
-
-            user = args[2] if len(args) > 2 else "admin"
-            password = args[3] if len(args) > 3 else ""
-            srv_alias = args[4] if len(args) > 4 else f"{host.replace('.', '_')}_{port}"
-
-            await self._add_system_message(f"Connecting and verifying credentials on remote server [cyan]{host}:{port}[/cyan]...")
-
-            # Validate remote server connection via HTTP request
-            import httpx
-            auth_h = "Basic " + base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("utf-8")
-            try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    resp = await client.get(
-                        f"http://{host}:{port}/v1/models",
-                        headers={"Authorization": auth_h},
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        remote_models = [m.get("id") for m in data.get("data", [])]
-                        save_remote_server(srv_alias, host, port, user, password)
-                        # Store cached models in remote server entry
-                        cfg = get_server_config()
-                        if srv_alias in cfg.get("remote_servers", {}):
-                            cfg["remote_servers"][srv_alias]["cached_models"] = remote_models
-                            from phantombox.server import save_server_config
-                            save_server_config(cfg)
-
-                        await self._add_system_message(
-                            f"[bold green]Connected successfully to remote server '{srv_alias}'![/bold green]\n"
-                            f"Discovered {len(remote_models)} model(s): {', '.join(remote_models[:5])}...\n"
-                            f"Type [cyan]/models[/cyan] to switch to models on this remote server."
-                        )
-                    elif resp.status_code == 401:
-                        await self._add_system_message(f"[bold red]Authentication failed[/bold red] on {host}:{port}. Check username and password.")
-                    else:
-                        await self._add_system_message(f"[red]Remote server replied with status {resp.status_code}:[/red] {resp.text}")
-            except Exception as e:
-                await self._add_system_message(f"[bold red]Could not reach server at {host}:{port}:[/bold red] {e}")
+            await self._run_server_connect_flow(
+                args[1] if len(args) > 1 else "",
+                args[2] if len(args) > 2 else "",
+                args[3] if len(args) > 3 else "",
+            )
             return
 
-        # 8. /server remotes
+        # 10. /server remotes
         if subcmd == "remotes":
             remotes = list_remote_servers()
             if not remotes:
-                await self._add_system_message("No remote servers connected. Connect with [cyan]/server --connect <host:port> <user> <pass>[/cyan]")
+                await self._add_system_message("No remote servers connected. Use [cyan]/server scan[/cyan] or [cyan]/server --connect <host:port>[/cyan]")
             else:
                 lines = [f"[bold cyan]Connected Remote Servers ({len(remotes)}):[/bold cyan]"]
                 for name, info in remotes.items():
@@ -2194,8 +3285,243 @@ class PhantomChat(App):
 
         await self._add_system_message(
             f"Unknown server subcommand '[bold]{subcmd}[/bold]'.\n"
-            f"Options: [cyan]start, close, user, users, discoverable, --connect, --discover, remotes[/cyan]"
+            f"Options: [cyan]start, close, scan, --connect, sign-out, config, user, users, discoverable, remotes[/cyan]"
         )
+
+    # ------------------------------------------------------------------
+    # Remote-server connect / scan flows (interactive, prompt-box driven)
+    # ------------------------------------------------------------------
+
+    async def _probe_remote_info(self, host: str, port: int) -> Optional[Dict[str, Any]]:
+        """GET /v1/info on a candidate host; None when unreachable."""
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(f"http://{host}:{port}/v1/info")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("app") == "phantombox":
+                        return data
+        except Exception:
+            pass
+        return None
+
+    async def _run_server_scan_flow(self) -> None:
+        """'/server scan' — discover nearby PhantomBox servers and offer to connect."""
+        from phantombox.server import discover_lan_servers
+
+        spinner = await self._start_status("Scanning network…")
+        try:
+            found = await asyncio.to_thread(discover_lan_servers, 2.0)
+        finally:
+            await self._stop_status(spinner)
+
+        if not found:
+            await self._add_system_message(
+                "[bold red]The preferred network is either not open or the entered IP is unreachable, please try again later[/bold red]"
+            )
+            return
+
+        lines = [f"[bold green]Found {len(found)} PhantomBox server(s) on this network:[/bold green]"]
+        for idx, s in enumerate(found, 1):
+            dtype = s.get("device_type", "unknown")
+            lines.append(
+                f"  [{idx}] [bold]{s.get('server_name')}[/bold] — [cyan]{s.get('ip')}:{s.get('port')}[/cyan] "
+                f"[dim]({dtype})[/dim]"
+            )
+        lines.append("\nType the number to connect, or press enter to cancel.")
+        await self._add_system_message("\n".join(lines))
+
+        choice = await self._ask_input("Select a server [1-{}] (empty = cancel):".format(len(found)))
+        if not choice or not choice.isdigit() or not (1 <= int(choice) <= len(found)):
+            await self._add_system_message("[dim]Scan cancelled.[/dim]")
+            return
+        target = found[int(choice) - 1]
+        await self._run_server_connect_flow(f"{target.get('ip')}:{target.get('port')}")
+
+    async def _run_server_connect_flow(self, hostport: str, preset_user: str = "", preset_pass: str = "") -> None:
+        """Interactive connect: probe host -> menu (Sign In / Help / Exit) -> auth -> session."""
+        target = (hostport or "").replace("http://", "").replace("https://", "").strip()
+        if not target:
+            # No target given: show live scan results so the user can pick one
+            await self._add_system_message("Specify a host, or run [cyan]/server scan[/cyan] to find servers on this network.")
+            return
+        if ":" in target:
+            host, port_str = target.split(":", 1)
+            port = int(port_str) if port_str.isdigit() else 8443
+        else:
+            host, port = target, 8443
+
+        spinner = await self._start_status(f"Connecting to {host}:{port}…")
+        try:
+            info = await self._probe_remote_info(host, port)
+        finally:
+            await self._stop_status(spinner)
+
+        if info is None:
+            await self._add_system_message(
+                "[bold red]The preferred network is either not open or the entered IP is unreachable, please try again later[/bold red]"
+            )
+            return
+
+        # Connection is open: show the connect menu
+        signup_mode = info.get("signup_mode", "open")
+        device_type = info.get("device_type", "unknown")
+        await self._add_system_message(
+            f"[bold green]Connected to[/bold green] [bold]{info.get('name', host)}[/bold] [dim]({device_type}, signup: {signup_mode})[/dim]\n"
+            f"Host: [cyan]{info.get('ip', host)}:{info.get('port', port)}[/cyan]\n\n"
+            "[bold]Options:[/bold]\n"
+            "  1. Sign In\n"
+            "  2. Help\n"
+            "  3. Exit\n"
+            f"\n[dim]Server IP: {info.get('ip', host)}  •  Port: {info.get('port', port)}[/dim]"
+        )
+        choice = await self._ask_input("Choose an option (1/2/3):", default="3")
+
+        if choice == "2":
+            await self._add_system_message(
+                "[bold cyan]Remote connection help[/bold cyan]\n"
+                "• Sign In — use an account that already exists on the host server.\n"
+                "• New users: pick Sign Up inside the Sign In flow; the host's signup rules decide what happens next.\n"
+                "• While connected you can chat with the host's models and search routes — everything else is read-only.\n"
+                "• Leave the session any time with [cyan]/server sign-out[/cyan]."
+            )
+            return
+        if choice != "1":
+            await self._add_system_message("[dim]Connect cancelled.[/dim]")
+            return
+
+        # --- Sign In branch: Saved user vs New user ---
+        await self._add_system_message(
+            "[bold]Sign In:[/bold]\n"
+            "  1. Saved User\n"
+            "  2. New user"
+        )
+        sub = await self._ask_input("Choose (1/2):", default="1")
+
+        if sub == "2":
+            await self._run_remote_signup_flow(host, port, signup_mode)
+            return
+
+        # Saved user: username then password, retried on failure
+        username = preset_user or await self._ask_input("Username:")
+        if not username:
+            await self._add_system_message("[dim]Sign-in cancelled.[/dim]")
+            return
+        password = preset_pass or await self._ask_input("Password:")
+        if not password:
+            await self._add_system_message("[dim]Sign-in cancelled.[/dim]")
+            return
+        await self._remote_sign_in(host, port, username, password)
+
+    async def _remote_sign_in(self, host: str, port: int, username: str, password: str) -> None:
+        """Authenticate against the host and activate the read-only remote session."""
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.post(
+                    f"http://{host}:{port}/v1/auth/login",
+                    json={"username": username, "password": password},
+                )
+        except Exception as exc:
+            await self._add_system_message(
+                f"[bold red]The preferred network is either not open or the entered IP is unreachable, please try again later[/bold red]\n[dim]({exc})[/dim]"
+            )
+            return
+
+        if resp.status_code == 403:
+            await self._add_system_message(
+                "[bold yellow]Your credentials are still awaiting pending approval. Please contact the network host.[/bold yellow]"
+            )
+            return
+        if resp.status_code == 401:
+            await self._add_system_message("[bold red]Incorrect username or password.[/bold red] Please try again with /server --connect.")
+            return
+        if resp.status_code != 200:
+            await self._add_system_message(f"[bold red]Sign-in failed (HTTP {resp.status_code}):[/bold red] {resp.text[:200]}")
+            return
+
+        data = resp.json()
+        token = data.get("token", "")
+        if not token:
+            await self._add_system_message("[bold red]Sign-in failed:[/bold red] the server did not return a session token.")
+            return
+
+        self.remote_session = {
+            "host": host,
+            "port": port,
+            "username": data.get("username", username),
+            "url": f"http://{host}:{port}",
+            "token": token,
+        }
+        self._update_status_model()
+        await self._add_system_message(
+            f"[bold green]Connection established![/bold green] Signed in as [bold]{data.get('username', username)}[/bold] "
+            f"on [cyan]{host}:{port}[/cyan].\n"
+            "[dim]Remote mode: you can chat with the host's models and search routes. Settings, MCP and provider "
+            "commands are locked — use /server sign-out to leave."
+        )
+
+    async def _run_remote_signup_flow(self, host: str, port: int, signup_mode: str) -> None:
+        """'New user' -> Sign up: collect credentials, then apply the host's auth mode."""
+        if signup_mode == "email":
+            await self._add_system_message(
+                "[yellow]Feature is not available yet. Please contact support or the host for further validation[/yellow]"
+            )
+            return
+
+        await self._add_system_message("[bold]Sign up[/bold] — create an account on the host server")
+        username = await self._ask_input("New login:")
+        if not username:
+            await self._add_system_message("[dim]Sign up cancelled.[/dim]")
+            return
+        password = await self._ask_input("New password:")
+        if not password:
+            await self._add_system_message("[dim]Sign up cancelled.[/dim]")
+            return
+        confirm = await self._ask_input("Confirm password:")
+        if confirm != password:
+            await self._add_system_message("[bold red]Passwords do not match. Sign up cancelled.[/bold red]")
+            return
+
+        # Email mode would ask for an email here; that path is not active yet.
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.post(
+                    f"http://{host}:{port}/v1/auth/signup",
+                    json={"username": username, "password": password, "password_confirm": confirm},
+                )
+        except Exception as exc:
+            await self._add_system_message(
+                f"[bold red]The preferred network is either not open or the entered IP is unreachable, please try again later[/bold red]\n[dim]({exc})[/dim]"
+            )
+            return
+
+        if resp.status_code == 501:  # email mode on the host
+            await self._add_system_message(
+                "[yellow]Feature is not available yet. Please contact support or the host for further validation[/yellow]"
+            )
+            return
+        if resp.status_code == 409:
+            await self._add_system_message(f"[bold red]{resp.json().get('message', 'Username already taken.')}[/bold red]")
+            return
+        if resp.status_code == 202:
+            await self._add_system_message(
+                "[yellow]Your request has been sent to the network host for approval. Please try logging in later. "
+                "If you still can't log in, refer to the error message and contact the network host.[/yellow]"
+            )
+            return
+        if resp.status_code == 201:
+            data = resp.json()
+            await self._add_system_message(
+                "[bold green]Account created successfully! You can now log in[/bold green]\n"
+                "[dim]Choose 'Sign In' to continue.[/dim]"
+            )
+            # Straight into sign-in with the just-created credentials
+            username2 = await self._ask_input("Username:", default=username)
+            pw2 = await self._ask_input("Password:")
+            if pw2:
+                await self._remote_sign_in(host, port, username2, pw2)
+            return
+        await self._add_system_message(f"[bold red]Sign up failed (HTTP {resp.status_code}):[/bold red] {resp.text[:200]}")
 
     async def _handle_subagents_command(self, args: list[str], raw_arg: str) -> None:
         """Handle /subagents commands (help, setup, scripts, --list, rm, --global auto, auto)."""
@@ -2498,6 +3824,18 @@ class PhantomChat(App):
             f"({len(self.messages)} messages, Model: {self.model_name})"
         )
 
+    async def _send_route_status(self, mode_name: str, active: bool, on_desc: str, off_desc: str) -> None:
+        """Report the ON/OFF state of a single routing mode."""
+        suffix = self._get_router_mode_suffix()
+        tag = f"phantombox/routes{suffix}"
+        state = "[bold green]ON[/bold green]" if active else "[bold red]OFF[/bold red]"
+        desc = on_desc if active else off_desc
+        await self._add_system_message(
+            f"[bold cyan]Route Mode:[/bold cyan] {mode_name} — {state}\n"
+            f"{desc}\n"
+            f"Prompt tag shows: [bold]{tag}[/bold]"
+        )
+
     async def _handle_phantombox_command(self, args: list[str], raw_arg: str) -> None:
         """Handle /phantombox commands (/phantombox --router, --routes, etc.)."""
         self._switch_to_chat()
@@ -2510,49 +3848,315 @@ class PhantomChat(App):
 
         # ---- /phantombox --routes : scan every cloud model once, keep only 200 OK routes ----
         if args and args[0].lower() in ("--routes", "-rt", "routes"):
-            from phantombox.router import scan_all_routes
+            from phantombox.router import (
+                scan_all_routes,
+                exclude_route,
+                include_route,
+                set_shuffle_mode,
+                is_shuffle_mode,
+                set_overdrive_model,
+                clear_overdrive_model,
+                get_overdrive_model,
+                set_provider_filter,
+                clear_provider_filter,
+                get_provider_filter,
+                get_excluded_models,
+            )
 
-            force_rescan = len(args) > 1 and args[1].lower() in ("--rescan", "rescan", "refresh")
+            rest = [a.lower() for a in args[1:]]
+            sub = rest[0] if rest else ""
+
+            # Validate the subcommand up front. Previously anything unrecognised
+            # (e.g. `--routes bogus`) fell through to a full route scan, which
+            # looked like the argument had been accepted.
+            _VALID_ROUTE_SUBS = {
+                "", "--status", "status", "--rescan", "rescan", "refresh", "--all", "all",
+                "exclude", "include", "excluded", "exclusions", "shuffle", "overdrive",
+                "provider", "providers",
+            }
+            if sub and sub not in _VALID_ROUTE_SUBS and not sub.startswith("--"):
+                await self._add_system_message(
+                    f"[yellow]Unknown argument '{sub}'.[/yellow] Valid: "
+                    "[cyan]--status | rescan [provider] | exclude <model> | include <model> | "
+                    "shuffle [on|off|--status] | overdrive <model|off|--status> | "
+                    "provider <name|off|--list|--status>[/cyan]"
+                )
+                return
+
+            # ---- aggregate --status : every routing mode at once ----
+            if sub == "--status" or sub == "status":
+                from phantombox.router import get_overdrive_model as _god, get_provider_filter as _gpf, is_shuffle_mode as _ism, get_excluded_models as _gem
+                od = _god()
+                pf = _gpf()
+                sh = _ism()
+                ex = _gem()
+                tag = f"phantombox/routes{self._get_router_mode_suffix()}"
+                lines = [
+                    "[bold cyan]PhantomBox Route Mode Status[/bold cyan]",
+                    f"• Prompt tag: [bold]{tag}[/bold]",
+                    f"• Shuffle: {'[bold green]ON[/bold green]' if sh else '[dim]off[/dim]'}",
+                    f"• Overdrive: {'[bold green]ON[/bold green] (' + od + ')' if od else '[dim]off[/dim]'}",
+                    f"• Provider filter: {'[bold green]ON[/bold green] (' + pf + ')' if pf else '[dim]off[/dim]'}",
+                    f"• Excluded routes: {'[bold yellow]' + str(len(ex)) + '[/bold yellow]' if ex else '[dim]none[/dim]'}",
+                    "\n[dim]Toggle with /phantombox --routes shuffle|overdrive <model>|provider <name>, each accepts off / --status.[/dim]",
+                ]
+                if ex:
+                    lines += [f"    - {e}" for e in ex]
+                await self._add_system_message("\n".join(lines))
+                return
+
+            # ---- exclude --status / include --status ----
+            if sub in ("exclude", "include") and len(rest) > 1 and rest[1] in ("--status", "status"):
+                excluded = get_excluded_models()
+                if excluded:
+                    lines = [f"[bold cyan]Excluded routes ({len(excluded)}):[/bold cyan]"]
+                    lines += [f"  • {e}" for e in excluded]
+                    await self._add_system_message("\n".join(lines))
+                else:
+                    await self._add_system_message("No routes are excluded — all verified routes are active.")
+                return
+
+            # ---- exclude <model> ----
+            if sub == "exclude":
+                if len(args) < 3:
+                    await self._add_system_message(
+                        "[yellow]A model is required.[/yellow] Usage: "
+                        "[cyan]/phantombox --routes exclude <model>[/cyan] "
+                        "(or [cyan]exclude --status[/cyan] to list current exclusions)."
+                    )
+                    return
+                ok, msg = exclude_route(args[2])
+                self._update_status_model()
+                style = "green" if ok else "yellow"
+                await self._add_system_message(f"[{style}]{msg}[/{style}]")
+                return
+
+            # ---- include <model> (with 200 OK ping verification) ----
+            if sub == "include":
+                if len(args) < 3:
+                    await self._add_system_message(
+                        "[yellow]A model is required.[/yellow] Usage: "
+                        "[cyan]/phantombox --routes include <model>[/cyan] "
+                        "(see exclusions with [cyan]exclude --status[/cyan])."
+                    )
+                    return
+                await self._add_system_message(f"[dim]Pinging '{args[2]}' to verify it still returns 200 OK…[/dim]")
+                ok, msg = await asyncio.to_thread(include_route, args[2])
+                style = "green" if ok else "yellow"
+                await self._add_system_message(f"[{style}]{msg}[/{style}]")
+                return
+
+            # ---- shuffle / shuffle off / shuffle --status ----
+            if sub == "shuffle":
+                if len(rest) > 1 and rest[1] in ("--status", "status"):
+                    await self._send_route_status("shuffle", is_shuffle_mode(), "ON — every call picks a random verified model (only one verified model = always that model)", "OFF — routes are ordered fastest-first")
+                    return
+                turning_off = len(rest) > 1 and rest[1] in ("off", "disable", "no")
+                set_shuffle_mode(not turning_off)
+                if not turning_off:
+                    # Shuffle means a fresh random pick every call: drop the
+                    # mid-turn pin so the previous winner can't be preferred.
+                    from phantombox.providers import clear_pinned_router_model
+                    clear_pinned_router_model()
+                self._update_status_model()
+                state = "disabled" if turning_off else "ENABLED"
+                await self._add_system_message(
+                    f"[cyan]Route shuffle mode {state}.[/cyan] "
+                    + ("Routes fall back to fastest-first ordering." if turning_off else "Every call now randomly picks one of the verified routes (falling back to the next random route if it errors).")
+                    + f"\n[dim]Prompt tag now shows: phantombox/routes{self._get_router_mode_suffix() or ''}[/dim]"
+                )
+                return
+
+            # ---- overdrive <model> / overdrive off / overdrive --status ----
+            if sub == "overdrive":
+                if len(rest) > 1 and rest[1] in ("--status", "status"):
+                    current = get_overdrive_model()
+                    await self._send_route_status("overdrive", bool(current), f"ON — locked to {current} until its quota dies", "OFF — adaptive fastest-first routing")
+                    return
+                if len(rest) > 1 and rest[1] in ("off", "disable", "none", "no"):
+                    clear_overdrive_model()
+                    self._update_status_model()
+                    await self._add_system_message("[cyan]Overdrive disengaged.[/cyan] Routing returns to adaptive fastest-first.")
+                    return
+                if len(args) > 2:
+                    ok, msg = set_overdrive_model(args[2])
+                    if ok:
+                        from phantombox.providers import clear_pinned_router_model
+                        clear_pinned_router_model()
+                    self._update_status_model()
+                    style = "green" if ok else "yellow"
+                    suffix_note = f"\n[dim]Prompt tag now shows: phantombox/routes{self._get_router_mode_suffix() or ''}[/dim]" if ok else ""
+                    await self._add_system_message(f"[{style}]{msg}[/{style}]{suffix_note}")
+                    return
+                current = get_overdrive_model()
+                await self._add_system_message(
+                    f"Overdrive is currently: [bold]{current or 'OFF'}[/bold].\n"
+                    f"Usage: [cyan]/phantombox --routes overdrive <model_name>[/cyan] to lock onto one model, add [cyan]off[/cyan] to release, or [cyan]--status[/cyan] to check."
+                )
+                return
+
+            # ---- provider <name> / provider off / provider --list ----
+            if sub == "provider" or (rest and rest[0] == "providers"):
+                # provider --list (also tolerate the 'roviders --list' typo)
+                if len(rest) > 1 and rest[1] in ("--status", "status"):
+                    current = get_provider_filter()
+                    await self._send_route_status("provider", bool(current), f"ON — only routing through '{current}'", "OFF — all connected providers considered")
+                    return
+                if len(rest) > 1 and rest[1] in ("--list", "list", "--ls"):
+                    from phantombox.providers import list_connected_providers, get_provider
+                    conn = [p for p in list_connected_providers() if p != "phantombox"]
+                    active = get_provider_filter()
+                    counts: dict[str, int] = {}
+                    for v in get_verified_models():
+                        pid_v = (v.get("provider") or "").lower()
+                        counts[pid_v] = counts.get(pid_v, 0) + 1
+                    lines = ["[bold cyan]Connected Providers:[/bold cyan]"]
+                    if not conn:
+                        lines.append("  [dim](none — connect one with /providers --connect)[/dim]")
+                    for p in conn:
+                        mark = " [bold green](active filter)[/bold green]" if p == active else ""
+                        info = get_provider(p) or {}
+                        n = counts.get(p.lower(), 0)
+                        routes = f"{n} verified route(s)" if n else "[yellow]no verified routes — run rescan[/yellow]"
+                        lines.append(f"  • [bold]{p}[/bold] ({info.get('name', p)}) — {routes}{mark}")
+                    current = get_provider_filter()
+                    lines.append(f"\nActive provider filter: [bold]{current or 'OFF'}[/bold]")
+                    lines.append(
+                        "[dim]Use these exact names (or 'Claude'/'Groq'/'NVIDIA' style tags) with:\n"
+                        "  /phantombox --routes rescan <name>\n"
+                        "  /phantombox --routes provider <name>[/dim]"
+                    )
+                    await self._add_system_message("\n".join(lines))
+                    return
+                if len(rest) > 1 and rest[1] in ("off", "disable", "none", "no"):
+                    clear_provider_filter()
+                    self._update_status_model()
+                    await self._add_system_message("[cyan]Provider filter disabled.[/cyan] Routing again considers all connected providers.")
+                    return
+                if len(args) > 2:
+                    # Resolve + (when needed) live-probe off the UI thread so the
+                    # interface keeps animating while the provider is verified.
+                    ok, msg = await asyncio.to_thread(set_provider_filter, args[2])
+                    self._update_status_model()
+                    style = "green" if ok else "yellow"
+                    suffix_note = f"\n[dim]Prompt tag now shows: phantombox/routes{self._get_router_mode_suffix() or ''}[/dim]" if ok else ""
+                    await self._add_system_message(f"[{style}]{msg}[/{style}]{suffix_note}")
+                    return
+                # bare 'provider' -> status
+                current = get_provider_filter()
+                await self._add_system_message(
+                    f"Provider filter is currently: [bold]{current or 'OFF'}[/bold].\n"
+                    f"Usage: [cyan]/phantombox --routes provider <provider_name>[/cyan] (add [cyan]off[/cyan] to disable, or [cyan]--status[/cyan] to check), "
+                    f"or [cyan]/phantombox --routes provider --list[/cyan] to see connected providers."
+                )
+                return
+
+            # ---- excluded --list ----
+            if sub in ("excluded", "exclusions"):
+                excluded = get_excluded_models()
+                if excluded:
+                    lines = [f"[bold cyan]Excluded routes ({len(excluded)}):[/bold cyan]"]
+                    lines += [f"  • {e}" for e in excluded]
+                    lines.append("\n[dim]Re-include with: /phantombox --routes include <model> (verified by a live 200 OK ping)[/dim]")
+                    await self._add_system_message("\n".join(lines))
+                else:
+                    await self._add_system_message("No routes are currently excluded.")
+                return
+
+            force_rescan = sub in ("--rescan", "rescan", "refresh")
+            # Targeted rescan: /phantombox --routes rescan <provider>
+            scan_provider = None
+            if force_rescan and len(args) > 2 and args[2].lower() not in ("--all", "all"):
+                scan_provider = args[2]
+                force_rescan = True
             verified = get_verified_models()
 
             if force_rescan or not verified:
                 # Animated "Scanning Routes" spinner while the full probe runs
                 spinner = SpinnerThinking(color="#38bdf8", label_text="Scanning Routes…")
+                warning = Static(
+                    "[red]⚠ If you have many MCP servers connected, it might take a while to ping all of the models[/red]",
+                    id="scan-warning",
+                )
                 try:
                     chat_view = self.query_one("#chat-view", VerticalScroll)
                     await chat_view.mount(spinner)
+                    await chat_view.mount(warning)
                     chat_view.scroll_end(animate=False)
                 except Exception:
                     spinner = None
+                    warning = None
 
                 try:
-                    verified = await scan_all_routes()
+                    if scan_provider:
+                        # Resolve the name exactly as --list prints it. A name that
+                        # resolves is always treated as found; only the scan result
+                        # decides between 'no models' and 'no 200 OK'.
+                        from phantombox.router import _resolve_connected_provider
+                        from phantombox.providers import fetch_cached_or_default_models
+                        resolved_pid = _resolve_connected_provider(scan_provider)
+                        if not resolved_pid:
+                            from phantombox.providers import list_connected_providers
+                            conn = [p for p in list_connected_providers() if p != "phantombox"]
+                            await self._add_system_message(
+                                f"[yellow]'{scan_provider}' is not a connected provider. "
+                                f"Connected: {', '.join(conn) if conn else 'none'}.[/yellow]\n"
+                                f"[dim]Run [cyan]/phantombox --routes provider --list[/cyan] for the exact names, "
+                                f"or [cyan]/providers --connect[/cyan] to add a provider.[/dim]"
+                            )
+                            return
+                        await self._add_system_message(
+                            f"[dim]Targeted scan: pinging only [bold]{resolved_pid}[/bold] models…[/dim]"
+                        )
+                        verified = await scan_all_routes(provider_filter=resolved_pid, force_catalog=True)
+                        catalog = fetch_cached_or_default_models(resolved_pid)
+                        if not catalog:
+                            await self._add_system_message(
+                                f"[yellow]No models found for provider '{resolved_pid}'.[/yellow]\n"
+                                f"Its model catalog endpoint returned nothing (invalid/expired API key, no access, "
+                                f"or a provider without a catalog endpoint). Check the key via [cyan]/providers --connect[/cyan]."
+                            )
+                            return
+                        if not verified:
+                            await self._add_system_message(
+                                f"[yellow]No 200 OK routes for provider '{resolved_pid}'.[/yellow]\n"
+                                f"{len(catalog)} model(s) were found but none answered a probe "
+                                f"(quota exhausted, rate limited, or unsupported models)."
+                            )
+                            return
+                    else:
+                        verified = await scan_all_routes(force_catalog=True)
                 finally:
-                    if spinner:
-                        try:
-                            await spinner.remove()
-                        except Exception:
-                            pass
+                    for w in (spinner, warning):
+                        if w:
+                            try:
+                                await w.remove()
+                            except Exception:
+                                pass
             else:
                 # Instantly show the last scan; a background re-scan refreshes silently
                 await self._add_system_message(
-                    "[dim]Showing last verified routes. Add [cyan]rescan[/cyan] to force a fresh ping of every model."
+                    "[dim]Showing last verified routes. Add [cyan]rescan[/cyan] to force a fresh ping of every model "
+                    "(or [cyan]rescan <provider>[/cyan] to ping just one provider)."
                 )
 
             if not verified:
                 await self._add_system_message(
-                    "[yellow]No working routes found. Check that your provider API keys have valid quota via [cyan]/mcp --connect[/cyan].[/yellow]"
+                    "[yellow]No working routes found. Check that your provider API keys have valid quota via [cyan]/providers --connect[/cyan].[/yellow]"
                 )
                 return
 
             lines = [
                 "[bold cyan]PhantomBox Verified Routes[/bold cyan] "
-                f"({len(verified)} models returning 200 OK, fastest first):",
+                f"({len(verified)} models returning 200 OK):",
             ]
             for v in verified:
                 lat = v.get("last_latency", 0)
                 lat_str = f"{lat:.2f}s" if lat >= 1.0 else f"{int(lat*1000)}ms"
-                lines.append(f"  • [bold]{v.get('provider')}/{v.get('model_id')}[/bold] — [green]{lat_str}[/green]")
+                from phantombox.capabilities import supports_tools
+                cap = supports_tools(str(v.get('provider') or ""), str(v.get('model_id') or ""))
+                cap_str = "" if cap is not False else " [yellow](no tools)[/yellow]"
+                lines.append(f"  • [bold]{v.get('provider')}/{v.get('model_id')}[/bold] — [green]{lat_str}[/green]{cap_str}")
             lines.append(
                 "\n[dim]Switch to phantombox/router in /models to tap these routes instantly. "
                 "Routes refresh via /phantombox --routes rescan, or automatically scraped on error.[/dim]"
@@ -2568,12 +4172,11 @@ class PhantomChat(App):
                 "[bold cyan]PhantomBox Autonomous Smart Router Status[/bold cyan]",
                 f"• Active Model Identifier: [bold #f97316]phantombox/router[/bold #f97316]",
                 f"• Strategy: [green]{cfg.get('strategy', 'adaptive')}[/green] (prioritize proven working models)",
-                f"• Exploratory Attempts: [yellow]{cfg.get('max_exploratory_attempts', 10)}[/yellow] (tests up to 10 random models before guaranteed fallback)",
                 f"• Probe Timeout per Model: [dim]{cfg.get('timeout_per_attempt', 6.0)}s[/dim]",
                 f"• Verified 200 OK Models ({len(verified)}):",
             ]
             if verified:
-                for v in verified[:8]:
+                for v in verified:
                     p = v.get("provider")
                     m = v.get("model_id")
                     count = v.get("success_count", 1)
@@ -2583,9 +4186,17 @@ class PhantomChat(App):
                 lines.append("    [dim](No models benchmarked yet. Switch to 'phantombox/router' in /models to start auto-routing!)[/dim]")
 
             lines.append("\n[bold]Router Commands:[/bold]")
-            lines.append("  • [cyan]/phantombox --routes[/cyan] - Show every cloud model currently returning 200 OK (fastest first)")
+            lines.append("  • [cyan]/phantombox --routes[/cyan] - Show every cloud model currently returning 200 OK")
             lines.append("  • [cyan]/phantombox --routes rescan[/cyan] - Re-ping all cloud models now and rebuild the verified route table")
-            lines.append("  • [cyan]/models phantombox/router[/cyan] - Switch active chat model to Smart Router (taps verified routes instantly, re-scans in background after each reply)")
+            lines.append("  • [cyan]/phantombox --routes rescan <provider>[/cyan] - Faster: re-ping only one provider's models (e.g. rescan gemini)")
+            lines.append("  • [cyan]/phantombox --routes exclude <model>[/cyan] - Explicitly exclude a model from the route list ([cyan]--status[/cyan] to check)")
+            lines.append("  • [cyan]/phantombox --routes include <model>[/cyan] - Re-include an excluded model (verified via live 200 OK ping)")
+            lines.append("  • [cyan]/phantombox --routes shuffle[/cyan] - Random verified model on every call (add [cyan]off[/cyan] / [cyan]--status[/cyan])")
+            lines.append("  • [cyan]/phantombox --routes overdrive <model>[/cyan] - Commit to one model until quota dies (add [cyan]off[/cyan] / [cyan]--status[/cyan])")
+            lines.append("  • [cyan]/phantombox --routes provider <name>[/cyan] - Only route through a specific provider (add [cyan]off[/cyan] / [cyan]--status[/cyan] / [cyan]--list[/cyan])")
+            lines.append("  • [cyan]/phantombox --routes --status[/cyan] - Show every routing mode's ON/OFF state and the current prompt tag")
+            lines.append("  • [dim]Prompt tag reflects the active mode: phantombox/routes → /shuffle, /<provider>, or /overdrive[/dim]")
+            lines.append("  • [cyan]/models phantombox/router[/cyan] - Switch active chat model to Smart Router")
             lines.append("  • [cyan]/phantombox --router clear[/cyan] - Reset verified routes history")
             lines.append("  • [cyan]/phantombox --router timeout <seconds>[/cyan] - Set per-model probe timeout")
 
@@ -2618,6 +4229,9 @@ class PhantomChat(App):
         await self._add_system_message(
             "Usage:\n"
             "  • [cyan]/phantombox --routes[/cyan] - Show verified 200 OK routes (add [cyan]rescan[/cyan] to re-ping every model now)\n"
+            "  • [cyan]/phantombox --routes rescan <provider>[/cyan] - Faster targeted re-ping of just one provider\n"
+            "  • [cyan]/phantombox --routes exclude|include|shuffle|overdrive|provider ...[/cyan] - Advanced route controls\n"
+            "  • [cyan]/phantombox --routes --status[/cyan] - Show every routing mode's ON/OFF state\n"
             "  • [cyan]/phantombox --router[/cyan] - View or configure the Smart Router."
         )
 
@@ -2687,7 +4301,10 @@ class PhantomChat(App):
                     or (pid == "anthropic" and f"claude/{mid}" == self.model_name)
                 )
                 curr_str = " [CURRENT]" if is_current else ""
-                label = f"● [{tag}] {mid}{curr_str}"
+                from phantombox.capabilities import tool_capability_label
+                cap = tool_capability_label(pid, mid)
+                cap_str = "" if cap == "tools: yes" else f" [dim]({cap})[/dim]"
+                label = f"● [{tag}] {mid}{cap_str}{curr_str}"
                 options.append((full_model_id, label, True))
 
         # 3. Connected Remote PhantomBox Servers (/server --connect)
@@ -2721,10 +4338,174 @@ class PhantomChat(App):
 
         self.push_screen(ModelPickerModal(self.model_name, options, theme_color=self.theme_color), on_selected)
 
+    async def _open_models_picker_async(self) -> None:
+        """Load every connected provider's live catalog, then open /models.
+
+        Previously /models opened instantly from whatever happened to be in the
+        in-memory cache, so a fresh chat session showed only local models until
+        the background warm-up finished (or forever, if it had failed). Now the
+        catalogs are fetched concurrently right before the picker opens.
+        """
+        from phantombox.providers import list_connected_providers, fetch_provider_models
+
+        pids = [p for p in list_connected_providers() if p != "phantombox"]
+        if pids:
+            self._switch_to_chat()
+            status = None
+            try:
+                chat_view = self.query_one("#chat-view", VerticalScroll)
+                status = SpinnerThinking(color="#38bdf8", label_text="Loading provider models…")
+                await chat_view.mount(status)
+                chat_view.scroll_end(animate=False)
+            except Exception:
+                status = None
+            try:
+                await asyncio.gather(*(fetch_provider_models(pid) for pid in pids))
+            except Exception:
+                pass
+            finally:
+                if status is not None:
+                    try:
+                        await status.remove()
+                    except Exception:
+                        pass
+
+        self._open_models_picker()
+
+    @staticmethod
+    def _resolve_valid_model_argument(target: str, available: list[tuple[str, str, bool]]) -> tuple[str | None, str]:
+        """Map a user-typed /models argument onto a real, selectable model.
+
+        Returns (canonical_id, "") on success or (None, reason) on failure.
+
+        Arguments are only ever accepted when they identify a model the user is
+        actually allowed to pick: exact id, ``provider/model``, ``provider:model``,
+        a bare model id, or a router mode tag (``phantombox/router/shuffle``).
+        Everything else is rejected instead of being silently turned into a
+        llama.cpp start attempt for a model that does not exist.
+        """
+        raw = (target or "").strip()
+        if not raw:
+            return None, "No model given."
+
+        lower = raw.lower()
+        ids = [mid for mid, _label, _ok in available]
+        lower_map = {mid.lower(): mid for mid in ids}
+
+        # 1. Exact identifier as the picker uses it.
+        if lower in lower_map:
+            return lower_map[lower], ""
+
+        # 2. Router modes with an optional suffix (shuffle / overdrive / provider).
+        from phantombox.providers import split_router_mode_suffix
+
+        base, mode = split_router_mode_suffix(raw)
+        if base.lower() in ("phantombox/router", "phantombox/routes", "router"):
+            if not mode:
+                return "phantombox/router", ""
+            if mode == "shuffle":
+                from phantombox.router import set_shuffle_mode
+
+                set_shuffle_mode(True)
+                return "phantombox/router", ""
+            if mode == "overdrive":
+                # Overdrive needs a model: the user must supply one.
+                return None, (
+                    "'/models phantombox/router/overdrive' needs a model. Use "
+                    "[cyan]/phantombox --routes overdrive <model>[/cyan] and then "
+                    "[cyan]/models phantombox/router/overdrive[/cyan]."
+                )
+            from phantombox.router import set_provider_filter
+
+            ok, msg = set_provider_filter(mode)
+            if not ok:
+                return None, msg
+            return "phantombox/router", ""
+
+        # 3. 'provider:model' / 'provider/model' spelled with a known provider.
+        from phantombox.providers import get_provider
+
+        provider_part, sep, rest = raw.partition(":") if ":" in raw else raw.partition("/")
+        p_info = get_provider(provider_part.lower()) if sep else None
+        if p_info and rest:
+            candidate = f"{p_info['id']}:{rest}"
+            if candidate.lower() in lower_map:
+                return lower_map[candidate.lower()], ""
+            return None, (
+                f"'{rest}' is not in {p_info.get('name', p_info['id'])}'s catalog. "
+                "Run [cyan]/models[/cyan] to pick from the available models."
+            )
+
+        # 4. Bare model id that belongs to a connected provider.
+        suffix_hits = [mid for mid in ids if mid.lower().endswith(f":{lower}")]
+        if len(suffix_hits) == 1:
+            return suffix_hits[0], ""
+        if len(suffix_hits) > 1:
+            listed = ", ".join(suffix_hits[:6])
+            return None, (
+                f"'{raw}' exists on more than one provider. Be specific: {listed}"
+            )
+
+        # 5. Local model names (picker shows them unqualified).
+        if any(mid.lower() == lower for mid, _l, _o in available if not mid.startswith(("phantombox", "server/", "remote/"))):
+            return lower, ""
+
+        return None, (
+            f"'{raw}' is not a valid model. Run [cyan]/models[/cyan] to choose from the "
+            "available local and connected cloud models."
+        )
+
+    @staticmethod
+    def _split_router_imprint(text: str) -> tuple[str, bool]:
+        """Strip a textual 'Response returned by …' footer out of streamed text.
+
+        Returns (clean_text, had_imprint). Attribution is rendered once, from
+        router_meta, so any footer embedded in the body is removed here.
+        """
+        if "Response returned by:" not in text:
+            return text, False
+        marker = text.find("Response returned by:")
+        clean = text[:marker]
+        # Drop the '---' rule and blank lines that precede the footer.
+        clean = clean.rstrip()
+        while clean.endswith("---"):
+            clean = clean[:-3].rstrip()
+        return clean, True
+
+    def _imprint_line(self) -> str:
+        """Single attribution line for the last routed reply (empty if none)."""
+        meta = getattr(self, "_last_router_meta", {}) or {}
+        if not meta or meta.get("overdrive_failed"):
+            return ""
+        model = meta.get("model")
+        if not model:
+            return ""
+        sub = " [bold cyan](subagent1)[/bold cyan]" if meta.get("subagents_mode") else ""
+        return (
+            f"[dim]Response returned by:[/dim] [bold cyan]{model}[/bold cyan] "
+            f"[dim]via[/dim] [bold #f97316]phantombox[/bold #f97316]{sub} "
+            f"[dim]after[/dim] [bold green]{meta.get('time', '')}[/bold green]"
+        )
+
     async def _switch_to_model(self, target_name: str) -> None:
         """Switch active model, supporting local llama servers and connected cloud providers."""
         self._switch_to_chat()
         target_key = target_name.strip()
+
+        # Validate against the REAL selectable set before doing anything. Without
+        # this, any string was accepted and then handed to the local-server
+        # starter, which failed with a confusing 'could not start' error.
+        try:
+            available = self._get_all_available_models()
+        except Exception:
+            available = []
+        resolved, reason = self._resolve_valid_model_argument(target_key, available)
+        if resolved is None:
+            await self._add_system_message(f"[yellow]{reason}[/yellow]")
+            return
+        if resolved != target_key:
+            target_key = resolved
+            self._update_status_model()
 
         # Check if target is a remote provider model
         if target_key in ("phantombox/router", "router"):
@@ -2762,7 +4543,7 @@ class PhantomChat(App):
             if not is_provider_connected(pid):
                 await self._add_system_message(
                     f"[yellow]Provider '{p_info['name']}' is not connected.[/yellow] "
-                    f"Run [cyan]/mcp --connect[/cyan] to connect your API key."
+                    f"Run [cyan]/providers --connect[/cyan] to connect your API key."
                 )
                 return
 
@@ -2806,10 +4587,11 @@ class PhantomChat(App):
 
         await self._add_system_message(
             f"[red]Could not start '{target_key}'.[/red] "
-            f"Please ensure it is downloaded or connect a provider with [cyan]/mcp --connect[/cyan]."
+            f"Please ensure it is downloaded or connect a provider with [cyan]/providers --connect[/cyan]."
         )
 
     async def _send_user_message(self, text: str) -> None:
+        self._record_history(text)
         if self._is_generating:
             self._stop_requested = True
             if self._current_thinking_container:
@@ -2822,6 +4604,8 @@ class PhantomChat(App):
 
         self._stop_requested = False
         self._is_generating = True
+        # Attribution for THIS turn only (a stale value must never leak through).
+        self._last_router_meta = {}
 
         # Clear any pinned router model from previous turns so new user message gets a fresh optimal route
         from phantombox.providers import clear_pinned_router_model
@@ -2837,6 +4621,24 @@ class PhantomChat(App):
         chat_view.scroll_end(animate=False)
 
         # Show thinking indicator with spinner using assistant color
+        # Defensive cleanup: if a previous turn left a stale thinking/spinner row
+        # in the view (e.g. after an unhandled worker crash), remove it first so
+        # mounting a new one can never raise DuplicateIds.
+        try:
+            for stale_row in chat_view.query(".role-assistant#thinking-row, .role-assistant[id^='thinking-row']"):
+                await stale_row.remove()
+        except Exception:
+            pass
+        try:
+            stale_spinner = chat_view.query_one("#active-stream-spinner")
+            await stale_spinner.remove()
+        except Exception:
+            pass
+
+        # Unique per-turn id: two turns can never collide on the same widget id.
+        self._thinking_seq = getattr(self, "_thinking_seq", 0) + 1
+        thinking_row_id = f"thinking-row-{self._thinking_seq}"
+
         asst_header = Static(f"● {self.assistant_name}", classes="message-header")
         if self.assistant_color:
             asst_header.styles.color = self.assistant_color
@@ -2844,7 +4646,7 @@ class PhantomChat(App):
         thinking_container = Container(
             asst_header,
             SpinnerThinking(color=self.assistant_color),
-            id="thinking-row",
+            id=thinking_row_id,
             classes="message-row role-assistant",
         )
         self._current_thinking_container = thinking_container
@@ -2860,7 +4662,40 @@ class PhantomChat(App):
         chat_view = self.query_one("#chat-view")
 
         loop_count = 0
-        max_tool_loops = 5
+        # Tool-loop budget is MODEL-DRIVEN: the model decides how many rounds of
+        # tool calls it needs and keeps going until it answers with pure text.
+        # max_tool_loops is only a hard safety guard against a runaway loop —
+        # not a quota. If the guard trips, one final synthesis call still runs
+        # (see below) so the user always gets an actual answer.
+        max_tool_loops = 32
+
+        # Tool capability gate: sending tool schemas to a model that cannot use
+        # them either does nothing (silently ignored) or, on some endpoints,
+        # returns a hard 400. Decide once per turn and tell the user why.
+        #
+        # Tool schemas come from the manager's in-memory cache, so this is fast;
+        # but if a warm-up MCP connect pass is still running we wait for it here
+        # (off the UI thread) so the user sees exactly what is happening instead
+        # of a generic spinner.
+        spinner_lbl = self._current_thinking_container
+        if spinner_lbl is not None:
+            try:
+                spinner_lbl.query_one(SpinnerThinking).set_label(self._tool_prep_label())
+            except Exception:
+                pass
+        turn_tools = await asyncio.to_thread(self._tools_for_active_model)
+        if spinner_lbl is not None:
+            try:
+                spinner_lbl.query_one(SpinnerThinking).set_label("Thinking…")
+            except Exception:
+                pass
+        if self._tools_disabled_notice_pending:
+            self._tools_disabled_notice_pending = False
+            await self._add_system_message(
+                f"[yellow]This model ({self.model_name}) does not support tool calling.[/yellow] "
+                "It will answer from its own knowledge only — no file, terminal or MCP tools.\n"
+                "[dim]Switch to a tool-capable model with /models (look for 'tools: yes'), or use /phantombox --routes.[/dim]"
+            )
 
         while loop_count < max_tool_loops:
             if self._stop_requested:
@@ -2876,10 +4711,28 @@ class PhantomChat(App):
                     self.model_name,
                     self.port,
                     self.messages,
-                    get_tool_definitions(),
+                    turn_tools,
                 ):
                     if self._stop_requested:
                         break
+
+                    # Router attribution arrives as router_meta, not as text.
+                    # The fallback branch of the router *also* appended a plain
+                    # 'Response returned by ...' footer into the stream, so a
+                    # routed turn rendered TWO imprints (one generated by the
+                    # message body, a second printed separately by the caller).
+                    # Capture the meta, strip any textual footer, and show exactly
+                    # one attribution line.
+                    meta = delta.get("router_meta")
+                    if meta:
+                        self._last_router_meta = meta
+
+                    raw_content = delta.get("content")
+                    if raw_content:
+                        content_chunk, _had_imprint = self._split_router_imprint(raw_content)
+                    else:
+                        content_chunk = raw_content
+
                     # Handle tool calls stream chunk
                     raw_tool_calls = delta.get("tool_calls")
                     if raw_tool_calls:
@@ -2913,7 +4766,7 @@ class PhantomChat(App):
                         continue
 
                     # Handle content tokens stream chunk
-                    content_chunk = delta.get("content")
+                    content_chunk = content_chunk if content_chunk else None
                     if content_chunk:
                         if first_token:
                             await thinking_container.remove()
@@ -2947,6 +4800,15 @@ class PhantomChat(App):
                 if self._stop_requested:
                     if full_reply:
                         self.messages.append({"role": "assistant", "content": full_reply})
+                    # Purge every leftover spinner so nothing keeps animating
+                    try:
+                        await chat_view.query_one("#active-stream-spinner").remove()
+                    except Exception:
+                        pass
+                    try:
+                        await thinking_container.remove()
+                    except Exception:
+                        pass
                     self._is_generating = False
                     self._current_thinking_container = None
                     self._update_status_model()
@@ -3033,13 +4895,18 @@ class PhantomChat(App):
                         })
 
                     # Create a new thinking container for the follow-up generation
+                    try:
+                        stale_row = chat_view.query_one("#thinking-row-1")
+                        await stale_row.remove()
+                    except Exception:
+                        pass
                     asst_header = Static(f"● {self.assistant_name}", classes="message-header")
                     if self.assistant_color:
                         asst_header.styles.color = self.assistant_color
                     thinking_container = Container(
                         asst_header,
                         SpinnerThinking(color=self.assistant_color, label_text="Synthesizing…"),
-                        id="thinking-row",
+                        id="thinking-row-1",
                         classes="message-row role-assistant",
                     )
                     await chat_view.mount(thinking_container)
@@ -3057,6 +4924,17 @@ class PhantomChat(App):
                         sender_color=self.assistant_color,
                     )
                     await chat_view.mount(current_assistant_msg)
+
+                # Exactly one attribution line for a routed turn (see
+                # _split_router_imprint: the textual footer was already stripped).
+                imprint = self._imprint_line()
+                if imprint and current_assistant_msg is not None:
+                    try:
+                        line = current_assistant_msg.query_one("#message-imprint-line", Static)
+                        line.update(imprint)
+                        line.styles.display = "block"
+                    except Exception:
+                        pass
 
                 # Keep stored conversation history CLEAN for subagents/helpers:
                 # strip the router attribution imprint so the suggestions generator
@@ -3133,11 +5011,18 @@ class PhantomChat(App):
 
             except Exception as e:
                 self._is_generating = False
-                self._current_thinking_container = None
+                # Remove EVERY leftover spinner (thinking row + streaming spinner)
+                # so nothing animates after the model finishes or hits an error.
+                for leftover_id in ("#active-stream-spinner",):
+                    try:
+                        await chat_view.query_one(leftover_id).remove()
+                    except Exception:
+                        pass
                 try:
                     await thinking_container.remove()
                 except Exception:
                     pass
+                self._current_thinking_container = None
                 if not self._stop_requested:
                     await self._add_system_message(f"[red]Error communicating with model: {e}[/red]")
                 break
@@ -3146,11 +5031,98 @@ class PhantomChat(App):
         self._current_thinking_container = None
         self._update_status_model()
 
+        # Model-driven tool loops (max_tool_loops is only a runaway guard): if the
+        # guard tripped while the last message is still a tool result, run ONE
+        # final synthesis call so the user always receives an actual answer.
+        if loop_count >= max_tool_loops and self.messages and self.messages[-1].get("role") == "tool" and not self._stop_requested:
+            try:
+                thinking_container = Container(
+                    Static(f"● {self.assistant_name}", classes="message-header"),
+                    SpinnerThinking(color=self.assistant_color, label_text="Synthesizing…"),
+                    id="thinking-row-1",
+                    classes="message-row role-assistant",
+                )
+                try:
+                    stale_row = chat_view.query_one("#thinking-row-1")
+                    await stale_row.remove()
+                except Exception:
+                    pass
+                await chat_view.mount(thinking_container)
+                chat_view.scroll_end(animate=False)
+
+                full_reply = ""
+                first_token = True
+                current_assistant_msg: ChatMessage | None = None
+                tool_calls_dict: Dict[int, Dict[str, Any]] = {}
+
+                # stream_chat_deltas is imported at module level; do NOT re-import
+                # it here — a function-local import would shadow the global name
+                # for the entire function scope and raise UnboundLocalError in
+                # the main streaming loop above.
+                async for delta in stream_chat_deltas(
+                    model_identifier=self.model_name,
+                    local_port=self.port,
+                    messages=self.messages,
+                    tools=self.tools,
+                ):
+                    # Safety-guard synthesis stays pure text: any further tool
+                    # calls are dropped here (this branch only runs when the
+                    # runaway guard tripped, never in normal model-driven flow).
+                    if delta.get("tool_calls"):
+                        continue
+                    content = delta.get("content")
+                    if not content:
+                        continue
+                    if first_token:
+                        first_token = False
+                        try:
+                            await thinking_container.remove()
+                        except Exception:
+                            pass
+                        current_assistant_msg = ChatMessage(self.assistant_name, "", "assistant", sender_color=self.assistant_color)
+                        await chat_view.mount(current_assistant_msg)
+                    if current_assistant_msg:
+                        await current_assistant_msg.append_content(content)
+                    full_reply += content
+
+                if not full_reply:
+                    if first_token:
+                        try:
+                            await thinking_container.remove()
+                        except Exception:
+                            pass
+                        current_assistant_msg = ChatMessage(self.assistant_name, "(empty response)", "assistant", sender_color=self.assistant_color)
+                        await chat_view.mount(current_assistant_msg)
+
+                from phantombox.subagents import clean_message_for_subagent
+                self.messages.append({"role": "assistant", "content": clean_message_for_subagent(full_reply)})
+            except Exception:
+                pass
+
     async def _ask_user_permission(self, fn_name: str, fn_args: Dict[str, Any]) -> tuple[bool, str]:
         """Prompt user in chat log and await yes/y/no/n or a custom reply."""
+        from phantombox.tools import describe_tool_call
+        from phantombox.mcp import is_mcp_tool
+
         args_repr = json.dumps(fn_args, indent=2)
+        is_external = is_mcp_tool(fn_name)
+
+        if is_external:
+            server = fn_name.split("__", 1)[0]
+            header = (
+                f"[bold red]External tool[/bold red] [bold {self.theme_color}]{fn_name}[/bold {self.theme_color}] "
+                f"from MCP server [bold]{server}[/bold] wants to run.\n"
+                f"[dim]This code runs on a third-party server, not inside PhantomBox.[/dim]\n"
+                f"[bold]What it does:[/bold] {describe_tool_call(fn_name)}\n"
+            )
+        else:
+            header = (
+                f"The assistant wants to execute tool [bold {self.theme_color}]{fn_name}[/bold {self.theme_color}] "
+                f"in phantombox-dir with arguments:\n"
+            )
+
         confirm_text = (
-            f"The assistant wants to execute tool [bold {self.theme_color}]{fn_name}[/bold {self.theme_color}] in phantombox-dir with arguments:\n"
+            f"{header}"
             f"[dim]{args_repr}[/dim]\n"
             f"Allow execution? Type [bold green]y[/bold green] / [bold green]yes[/bold green] to allow, "
             f"[bold red]n[/bold red] / [bold red]no[/bold red] to reject, or type a custom command."

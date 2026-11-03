@@ -30,8 +30,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "enable_internet_search": True,
     # Model thinking / internal deep reasoning directive toggle
     "enable_thinking": False,
-    # External API / MCP providers: provider_id -> {"api_key": "...", "enabled": True}
+    # External cloud LLM providers: provider_id -> {"api_key": "...", "enabled": True}
     "providers": {},
+    # External MCP tool servers: name -> {"command", "args", "url", "token", "env", "enabled"}
+    "mcp_servers": {},
+    # MCP tool names (server__tool) the user explicitly auto-approved; every other
+    # MCP tool asks for confirmation before running.
+    "mcp_auto_approve": [],
     # PhantomBox Server configuration
     "server": {
         "host": "0.0.0.0",
