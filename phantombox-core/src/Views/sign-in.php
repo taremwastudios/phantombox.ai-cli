@@ -6,10 +6,13 @@
  * what the Core API returns:
  *
  *   1. email   -> POST /v1/identity/email/request
- *                 the response carries `profile_required`, telling the UI
- *                 whether this is an existing account or a new registration
+ *                 Core resolves the account BEFORE any code is sent and
+ *                 answers `account_status`:
+ *                   existing         -> step 2 (sign-in code already sent)
+ *                   profile_required -> step 3 (profile, then a code)
+ *                   new              -> step 3 (profile, then a code)
  *   2. code    -> POST /v1/identity/email/verify
- *   3. profile -> POST /v1/identity/profile/complete   (new accounts only)
+ *   3. profile -> POST /v1/identity/register   (new accounts only)
  *
  * Phantom Illusions Studio
  */
@@ -106,8 +109,12 @@ $initialEmail = (string) ($initialEmail ?? '');
     </div>
 </form>
 
-<!-- Step 3 — profile completion (new accounts only) -->
+<!-- Step 3 — profile details (new accounts only, BEFORE any code is sent) -->
 <form id="completeProfileForm" class="auth-form step-view hidden" novalidate>
+    <p class="form-hint" id="profileIntro">
+        No account exists for this address yet. Enter your details to create one;
+        we will then send a verification code.
+    </p>
     <div class="form-row">
         <div class="form-group">
             <label class="form-label" for="firstNameInput">First name</label>
@@ -129,7 +136,7 @@ $initialEmail = (string) ($initialEmail ?? '');
     </div>
 
     <button class="btn btn-block" type="submit" id="btnCompleteProfile">
-        <span class="btn-text">Complete profile</span>
+        <span class="btn-text">Create account &amp; send code</span>
         <span class="btn-spinner hidden" aria-hidden="true"></span>
     </button>
 </form>

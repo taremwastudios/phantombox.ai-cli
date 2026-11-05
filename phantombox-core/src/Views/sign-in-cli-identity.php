@@ -3,18 +3,16 @@
  * PhantomBox Identity - CLI device authorization panel
  *
  * Reached from the CLI via
- *   /sign-in/cli/identity?id=REFERENCE
+ *   /sign-in/cli/identity?id=REFERENCE&k=IDENTITY_SECRET
  *
- * The transaction details are read from the existing browser-facing Core
- * endpoint (GET /v1/identity/cli/authorization/{reference}); the decision is
- * submitted to the existing approve/deny endpoints with the user's bearer
- * session. Nothing here creates or simulates an authorization.
+ * The controller validates the identity link before this template is ever
+ * rendered, so $transaction is always a real, pending, unexpired transaction.
+ * The decision is submitted to the existing approve/deny endpoints with the
+ * user's bearer session. Nothing here creates or simulates an authorization.
  *
  * Expected variables:
- *   $reference        string  authorization reference from ?id=
- *   $lookupError      ?string error text when the transaction could not load
- *   $transaction      ?array  browser-safe projection from Core
- *   $isSignedIn       bool    a browser session was presented (best effort)
+ *   $reference    string  authorization reference from ?id=
+ *   $transaction  array   browser-safe projection from Core
  *
  * Phantom Illusions Studio
  */
@@ -22,12 +20,24 @@
 declare(strict_types=1);
 
 $reference = (string) ($reference ?? '');
-$lookupError = $lookupError ?? null;
-$transaction = $transaction ?? null;
-$isSignedIn = (bool) ($isSignedIn ?? false);
+$transaction = is_array($transaction ?? null) ? $transaction : [];
 
-$status = is_array($transaction) ? (string) ($transaction['status'] ?? 'pending') : '';
+// The link secret is deliberately NOT rendered: the page only needs the
+// public reference to submit the decision.
+$returnTo = '/sign-in/cli/identity?id=' . rawurlencode($reference);
+$status = (string) ($transaction['status'] ?? 'pending');
 ?>
+<!-- Sign-in panel: shown on this validated link when the browser has no
+     session yet. This is the only place the authentication UI is served. -->
+<div id="signInPanel" class="hidden" data-return-to="<?= h($returnTo) ?>">
+    <?php
+    $viewFile = __DIR__ . '/sign-in.php';
+    $initialEmail = '';
+    require $viewFile;
+    ?>
+</div>
+
+<div id="devicePanel">
 <header class="auth-heading">
     <span class="auth-kicker">PhantomBox Identity</span>
     <h1 class="auth-title">Authorize this device</h1>
@@ -51,13 +61,7 @@ $status = is_array($transaction) ? (string) ($transaction['status'] ?? 'pending'
     <span id="deviceAlertText"></span>
 </div>
 
-<?php if ($lookupError !== null): ?>
-    <div class="alert alert-error" role="alert">
-        <span><?= h($lookupError) ?></span>
-    </div>
-    <p class="auth-footnote">Run <strong>phantombox /user --signin</strong> again to start a fresh request.</p>
-
-<?php elseif ($status !== 'pending'): ?>
+<?php if ($status !== 'pending'): ?>
     <?php
     // The transaction has already been resolved (or expired) on the Core side.
     $message = 'approved' === $status
@@ -85,13 +89,13 @@ $status = is_array($transaction) ? (string) ($transaction['status'] ?? 'pending'
     <div class="device-actions" id="deviceActions">
         <button class="btn" type="button" id="btnApproveDevice"
                 data-reference="<?= h((string) $reference) ?>"
-                data-return-to="<?= h('/sign-in/cli/identity?id=' . $reference) ?>">
+                data-return-to="<?= h($returnTo) ?>">
             <span class="btn-text">Approve device</span>
             <span class="btn-spinner hidden" aria-hidden="true"></span>
         </button>
         <button class="btn btn-ghost" type="button" id="btnDenyDevice"
                 data-reference="<?= h((string) $reference) ?>"
-                data-return-to="<?= h('/sign-in/cli/identity?id=' . $reference) ?>">
+                data-return-to="<?= h($returnTo) ?>">
             <span class="btn-text">Deny</span>
             <span class="btn-spinner hidden" aria-hidden="true"></span>
         </button>
@@ -104,3 +108,4 @@ $status = is_array($transaction) ? (string) ($transaction['status'] ?? 'pending'
 <?php endif; ?>
 
 <p class="auth-footnote">Approving issues a PhantomBox CLI session to the requesting workstation. You must be signed in to PhantomBox Identity in this browser.</p>
+</div><!-- /devicePanel -->

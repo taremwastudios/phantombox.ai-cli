@@ -25,7 +25,13 @@
         return value;
     }
 
-    var returnTo = safeReturnTo(new URLSearchParams(window.location.search).get('return_to'));
+    // A validated CLI link embeds the sign-in panel and declares where to go
+    // after a successful sign-in; otherwise honour ?return_to=.
+    var embeddedPanel = document.getElementById('signInPanel');
+    var returnTo = safeReturnTo(
+        (embeddedPanel && embeddedPanel.getAttribute('data-return-to'))
+        || new URLSearchParams(window.location.search).get('return_to')
+    );
 
     // ---------------------------------------------------------------
     // Small helpers
@@ -110,6 +116,11 @@
     var requestForm = $('requestOtpForm');
 
     if (requestForm) {
+        // When embedded in a validated CLI link the panel starts hidden and is
+        // revealed only if the browser has no session yet.
+        if (embeddedPanel && loadSession()) {
+            embeddedPanel.classList.add('hidden');
+        }
         var verifyForm = $('verifyOtpForm');
         var profileForm = $('completeProfileForm');
         var emailInput = $('emailInput');
@@ -176,7 +187,7 @@
             verifyForm.classList.add('hidden');
             profileForm.classList.remove('hidden');
             setStep(3);
-            if (subtitle) subtitle.textContent = 'One last step: your account needs a few details.';
+            if (subtitle) subtitle.textContent = 'Enter your details to create your account.';
             var first = $('firstNameInput');
             if (first) first.focus();
         }
@@ -208,12 +219,27 @@
                     return;
                 }
 
-                // The server tells us whether this is a new account.
-                // `profile_required` is only present when the account still
-                // needs first/last name and phone.
-                var needsProfile = result.data.profile_required === true;
-                setFlow(needsProfile ? 'register' : 'signin');
+                // Core resolved the account BEFORE sending anything.
+                //   existing         -> a sign-in code was sent; go to step 2
+                //   profile_required -> collect the profile first
+                //   new              -> collect the profile first
+                var accountStatus = result.data.account_status;
 
+                if (accountStatus === 'new' || accountStatus === 'profile_required') {
+                    setFlow('register');
+                    showProfileStep();
+                    return;
+                }
+
+                if (accountStatus !== 'existing') {
+                    // Unknown contract value: do not guess, do not claim a code
+                    // was sent.
+                    showAlert(alertBox, alertText,
+                        'The Identity service returned an unexpected account status.', true);
+                    return;
+                }
+
+                setFlow('signin');
                 emailTarget.textContent = email;
                 showVerifyStep();
             }).catch(function () {
@@ -252,12 +278,6 @@
                 // A real session token is only ever minted by the server.
                 if (result.data.token) saveSession(result.data.token);
 
-                if (result.data.status === 'profile_required') {
-                    setFlow('register');
-                    showProfileStep();
-                    return;
-                }
-
                 // Existing, complete account — the flow is finished.
                 setStep(3);
                 window.location.href = returnTo || result.data.redirect || '/';
@@ -269,7 +289,7 @@
         });
 
         // ---------------------------------------------------------
-        // Step 3 — complete the profile (new accounts only)
+        // Step 3 — profile details for a NEW account, then its code
         // ---------------------------------------------------------
         profileForm.addEventListener('submit', function (event) {
             event.preventDefault();
@@ -278,12 +298,7 @@
             var firstName = ($('firstNameInput').value || '').trim();
             var lastName = ($('lastNameInput').value || '').trim();
             var phone = ($('phoneInput').value || '').trim();
-
-            var token = loadSession();
-            if (!token) {
-                showAlert(alertBox, alertText, 'Your sign-in session has expired. Please start again.', true);
-                return;
-            }
+            var email = (emailInput.value || '').trim();
 
             if (!firstName || !lastName) {
                 showAlert(alertBox, alertText, 'Please provide both first and last name.', true);
@@ -297,23 +312,26 @@
             var button = $('btnCompleteProfile');
             setLoading(button, true);
 
-            post('/v1/identity/profile/complete', {
+            // Core creates the account and sends its verification code.
+            post('/v1/identity/register', {
+                email: email,
                 first_name: firstName,
                 last_name: lastName,
                 phone_number: phone
-            }, token).then(function (result) {
+            }).then(function (result) {
                 setLoading(button, false);
 
                 if (!result.ok || !result.data || result.data.ok !== true) {
-                    showAlert(alertBox, alertText, errorText(result, 'Profile update failed.'), true);
-                    if (result.status === 401) clearSession();
+                    showAlert(alertBox, alertText, errorText(result, 'Could not create the account.'), true);
                     return;
                 }
 
-                window.location.href = returnTo || result.data.redirect || '/';
+                // Only now has a code actually been sent.
+                emailTarget.textContent = email;
+                showVerifyStep();
             }).catch(function () {
                 setLoading(button, false);
-                showAlert(alertBox, alertText, 'Network error — could not save your profile.', true);
+                showAlert(alertBox, alertText, 'Network error — could not create the account.', true);
             });
         });
 
@@ -376,9 +394,19 @@
 
     if (approveBtn) {
         // An approval requires a real, signed-in browser session. Without one,
-        // go to sign-in and return to this exact authorization link.
+        // show the sign-in form on THIS validated link (the only place the
+        // authentication UI is served) and return here afterwards.
         var deviceReturnTo = approveBtn.getAttribute('data-return-to') || '';
         if (!loadSession()) {
+            var signInPanel = $('signInPanel');
+            var devicePanel = $('devicePanel');
+            if (signInPanel && devicePanel) {
+                devicePanel.classList.add('hidden');
+                signInPanel.classList.remove('hidden');
+                var firstInput = $('emailInput');
+                if (firstInput) firstInput.focus();
+                return;
+            }
             window.location.replace('/sign-in?return_to=' + encodeURIComponent(deviceReturnTo));
             return;
         }

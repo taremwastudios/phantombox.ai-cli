@@ -85,6 +85,12 @@ class AuthorizationService
         $pollHash = password_hash($pollToken, PASSWORD_DEFAULT);
         $pollLookup = hash('sha256', $pollToken); // keyed lookup index (never the credential itself)
 
+        // Identity-link secret: proves the browser link was issued by Core for
+        // this transaction. Only its SHA-256 is stored; the plaintext is
+        // returned once to the CLI and embedded in the browser URL.
+        $identitySecret = 'idlink_' . bin2hex(random_bytes(24));
+        $identityHash   = hash('sha256', $identitySecret);
+
         $ttl = max(60, (int) Config::get('authz_ttl', 600));
         $interval = max(2, (int) Config::get('authz_poll_interval', 5));
         $expiresAt = (new DateTimeImmutable('+' . $ttl . ' seconds'))->format('Y-m-d H:i:s');
@@ -92,9 +98,9 @@ class AuthorizationService
         $stmt = $this->db->prepare(
             'INSERT INTO authorization_transactions
                 (reference, client_type, device_name, device_platform, device_version,
-                 ip_address, scope, poll_token_hash, poll_token_lookup, status,
-                 credential_issued, created_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NOW(), ?)'
+                 ip_address, scope, poll_token_hash, poll_token_lookup, identity_link_hash,
+                 status, credential_issued, created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NOW(), ?)'
         );
         $stmt->execute([
             $reference,
@@ -106,6 +112,7 @@ class AuthorizationService
             self::normalizeScope($scope),
             $pollHash,
             $pollLookup,
+            $identityHash,
             self::STATE_PENDING,
             $expiresAt,
         ]);
@@ -113,7 +120,7 @@ class AuthorizationService
         return [
             'status' => self::STATE_PENDING,
             'reference' => $reference,
-            'browser_url' => self::browserUrl($reference),
+            'browser_url' => self::browserUrl($reference, $identitySecret),
             'poll_token' => $pollToken,
             'expires_in' => $ttl,
             'interval' => $interval,
@@ -152,6 +159,70 @@ class AuthorizationService
     }
 
     // ---------------------------------------------------------------------
+    // 2b. Identity link validation (browser entry point)
+    // ---------------------------------------------------------------------
+
+    /**
+     * Validate a CLI identity link before the authentication UI is rendered.
+     *
+     * The link is valid only when ALL of the following hold:
+     *   - the reference and secret are well formed;
+     *   - the secret's SHA-256 matches the stored identity_link_hash;
+     *   - the transaction is still PENDING (not approved/denied/expired);
+     *   - the server-side expiry has not passed (expiry is enforced here, not
+     *     by the browser, and the browser never supplies a timestamp).
+     *
+     * The secret is never logged and never echoed back.
+     *
+     * @return array{valid:bool, reason:string, transaction:?array}
+     */
+    public function validateIdentityLink(string $reference, string $secret): array
+    {
+        $reference = trim($reference);
+        $secret    = trim($secret);
+
+        if ($reference === '' || $secret === '') {
+            return self::linkInvalid('missing');
+        }
+
+        if (preg_match('/^[a-zA-Z0-9_\-\.:]{6,128}$/', $reference) !== 1
+            || preg_match('/^idlink_[a-f0-9]{48}$/', $secret) !== 1) {
+            return self::linkInvalid('malformed');
+        }
+
+        $row = $this->findByReference($reference);
+        if ($row === null) {
+            return self::linkInvalid('unknown');
+        }
+
+        $storedHash = (string) ($row['identity_link_hash'] ?? '');
+        if ($storedHash === '' || !hash_equals($storedHash, hash('sha256', $secret))) {
+            return self::linkInvalid('unknown');
+        }
+
+        // Server-side expiry: a pending row past its window is expired now.
+        if ($row['status'] === self::STATE_PENDING && $this->isPastExpiry($row)) {
+            $this->markExpired($reference);
+            $row['status'] = self::STATE_EXPIRED;
+        }
+
+        if ($row['status'] !== self::STATE_PENDING) {
+            return self::linkInvalid((string) $row['status']);
+        }
+
+        return [
+            'valid'       => true,
+            'reason'      => 'pending',
+            'transaction' => self::toBrowserArray($row),
+        ];
+    }
+
+    private static function linkInvalid(string $reason): array
+    {
+        return ['valid' => false, 'reason' => $reason, 'transaction' => null];
+    }
+
+    // ---------------------------------------------------------------------
     // 3. Approve (explicit, authenticated, atomic)
     // ---------------------------------------------------------------------
 
@@ -165,8 +236,10 @@ class AuthorizationService
     public function approve(string $reference, string $sessionToken, string $clientType): array
     {
         $session = $this->requireApproverSession($sessionToken);
-        if (is_array($session) === false) {
-            return $session; // structured error from requireApproverSession()
+        // requireApproverSession() returns a structured error array on failure,
+        // so the failure test is `ok === false`, not `is_array()`.
+        if (($session['ok'] ?? true) === false) {
+            return $session;
         }
 
         $row = $this->findByReference($reference);
@@ -174,9 +247,10 @@ class AuthorizationService
             return self::fail('Authorization reference not found.', 404);
         }
 
-        if (self::clientTypeMismatch($row, $clientType)) {
-            return self::fail('Authorization transaction does not belong to this client type.', 403);
-        }
+        // The approving party acts through the web Identity app while the
+        // transaction was created by the CLI, so the DECIDING request's client
+        // type is intentionally NOT compared to the transaction's client_type.
+        // The header is still required and validated by the controller.
 
         // Only pending transactions can be approved. Expired pending rows
         // transition to expired instead of approving.
@@ -224,7 +298,7 @@ class AuthorizationService
     public function deny(string $reference, string $sessionToken, string $clientType): array
     {
         $session = $this->requireApproverSession($sessionToken);
-        if (is_array($session) === false) {
+        if (($session['ok'] ?? true) === false) {
             return $session;
         }
 
@@ -233,9 +307,8 @@ class AuthorizationService
             return self::fail('Authorization reference not found.', 404);
         }
 
-        if (self::clientTypeMismatch($row, $clientType)) {
-            return self::fail('Authorization transaction does not belong to this client type.', 403);
-        }
+        // Same rationale as approve(): the deciding client type is not
+        // compared to the transaction's client_type.
 
         if ($row['status'] === self::STATE_PENDING && $this->isPastExpiry($row)) {
             $this->markExpired($reference);
@@ -526,10 +599,18 @@ class AuthorizationService
         return ['ok' => false, 'error' => $message, 'code' => $code];
     }
 
-    private static function browserUrl(string $reference): string
+    /**
+     * Browser link for the CLI device authorization page.
+     *
+     * Carries the public reference (for display) and the identity-link secret
+     * (for server-side validation). The secret is what authorizes the page.
+     */
+    private static function browserUrl(string $reference, string $identitySecret): string
     {
         $base = (string) Config::get('identity_app_url', 'https://phantomboxai.phantom-illusions-studio.com');
-        return $base . '/sign-in/cli/identity?id=' . rawurlencode($reference);
+        return $base . '/sign-in/cli/identity'
+            . '?id=' . rawurlencode($reference)
+            . '&k=' . rawurlencode($identitySecret);
     }
 
     private static function normalizeScope(?string $scope): string

@@ -36,6 +36,16 @@ class IdentityController
         $this->emailAuth = new EmailAuthService();
     }
 
+    /**
+     * POST /v1/identity/email/request
+     * Body: { email }
+     *
+     * Resolves the account BEFORE any code is sent and returns the decision:
+     *   { ok, account_status: existing|profile_required|new, profile_required, message }
+     *
+     * `account_status` is the contract the Identity UI uses to choose between
+     * the sign-in flow and the registration flow.
+     */
     public function requestOtp(): void
     {
         $input = self::requestJson();
@@ -44,7 +54,40 @@ class IdentityController
             self::json($result, 422);
             return;
         }
-        self::json(['ok' => true, 'message' => $result['message']], 200);
+        self::json([
+            'ok' => true,
+            'account_status' => $result['account_status'] ?? 'existing',
+            'profile_required' => (bool) ($result['profile_required'] ?? false),
+            'message' => $result['message'] ?? 'Verification code sent',
+        ], 200);
+    }
+
+    /**
+     * POST /v1/identity/register
+     * Body: { email, first_name, last_name, phone_number }
+     *
+     * New-account path: creates the account with the collected profile and
+     * sends its verification code. Existing accounts are rejected here.
+     */
+    public function register(): void
+    {
+        $input = self::requestJson();
+        $result = $this->emailAuth->registerAndRequestCode(
+            (string) ($input['email'] ?? ''),
+            (string) ($input['first_name'] ?? ''),
+            (string) ($input['last_name'] ?? ''),
+            (string) ($input['phone_number'] ?? '')
+        );
+        if (!$result['ok']) {
+            self::json($result, 422);
+            return;
+        }
+        self::json([
+            'ok' => true,
+            'account_status' => $result['account_status'] ?? 'existing',
+            'profile_required' => false,
+            'message' => $result['message'] ?? 'Verification code sent',
+        ], 200);
     }
 
     public function verifyOtp(): void

@@ -25,71 +25,83 @@ class Router
         $uri = $_SERVER['REQUEST_URI'] ?? '/';
         $path = rtrim(parse_url($uri, PHP_URL_PATH) ?: '/', '/');
 
-        $authz = new AuthorizationController();
-        $identity = new IdentityController();
+        // Controllers are created LAZILY, inside the route that needs them.
+        // Constructing AuthorizationController opens a MySQL connection, so
+        // eager construction made every request (including plain HTML pages)
+        // depend on the database and returned HTTP 500 when it was unavailable.
+        $authz = null;
+        $identity = null;
 
         try {
             // ---------------- Identity lifecycle (existing contract) -------
             if ($method === 'POST' && $path === '/v1/identity/email/request') {
-                $identity->requestOtp();
+                ($identity ??= new IdentityController())->requestOtp();
+                return;
+            }
+            if ($method === 'POST' && $path === '/v1/identity/register') {
+                ($identity ??= new IdentityController())->register();
                 return;
             }
             if ($method === 'POST' && $path === '/v1/identity/email/verify') {
-                $identity->verifyOtp();
+                ($identity ??= new IdentityController())->verifyOtp();
                 return;
             }
             if ($method === 'POST' && $path === '/v1/identity/profile/complete') {
-                $identity->completeProfile();
+                ($identity ??= new IdentityController())->completeProfile();
                 return;
             }
             if ($method === 'GET' && $path === '/v1/identity/profile') {
-                $identity->profile();
+                ($identity ??= new IdentityController())->profile();
                 return;
             }
             if (($method === 'POST' || $method === 'GET') && $path === '/v1/identity/logout') {
-                $identity->logout();
+                ($identity ??= new IdentityController())->logout();
                 return;
             }
 
             // ---------------- Shared authorization lifecycle ---------------
             if ($method === 'POST' && $path === '/v1/identity/cli/authorization') {
-                $authz->create();
+                ($authz ??= new AuthorizationController())->create();
                 return;
             }
             if ($method === 'POST' && $path === '/v1/identity/cli/authorization/poll') {
-                $authz->poll();
+                ($authz ??= new AuthorizationController())->poll();
                 return;
             }
             if ($method === 'POST' && $path === '/v1/identity/cli/authorization/redeem') {
-                $authz->redeem();
+                ($authz ??= new AuthorizationController())->redeem();
                 return;
             }
             if ($method === 'POST' && $path === '/v1/identity/cli/authorization/approve') {
-                $authz->approve();
+                ($authz ??= new AuthorizationController())->approve();
                 return;
             }
             if ($method === 'POST' && $path === '/v1/identity/cli/authorization/deny') {
-                $authz->deny();
+                ($authz ??= new AuthorizationController())->deny();
                 return;
             }
             if ($method === 'POST' && $path === '/v1/identity/cli/authorization/expire') {
-                $authz->expire();
+                ($authz ??= new AuthorizationController())->expire();
                 return;
             }
             if ($method === 'GET' && preg_match('#^/v1/identity/cli/authorization/([^/]+)$#', $path, $m)) {
-                $authz->show($m[1]);
+                ($authz ??= new AuthorizationController())->show($m[1]);
                 return;
             }
 
             // ---------------- Identity HTML pages (browser UI) ------------
             // Presentation only: every authentication call still goes to the
-            // JSON API routes above.
-            if ($method === 'GET' && ($path === '/sign-in' || $path === '/sign-up')) {
-                (new IdentityPageController())->signIn();
-                return;
-            }
+            // JSON API routes above. The page controller is instantiated here
+            // and only here, so HTML rendering never touches the database.
             if ($method === 'GET' && $path === '/sign-in/cli/identity') {
                 (new IdentityPageController())->deviceAuthorization();
+                return;
+            }
+
+            // Direct access to the authentication interface is not allowed:
+            // the UI is only served after Core validates a CLI identity link.
+            if ($method === 'GET' && ($path === '/sign-in' || $path === '/sign-up')) {
+                (new IdentityPageController())->rejectDirectAccess();
                 return;
             }
 

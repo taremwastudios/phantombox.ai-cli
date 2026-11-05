@@ -223,6 +223,8 @@ body {
     letter-spacing: .08em;
     text-transform: uppercase;
     color: var(--fg-dim);
+    min-height: 22px;
+    overflow: hidden;
 }
 
 .step-item {
@@ -260,6 +262,7 @@ body {
 
 .step-rule {
     flex: 1 1 auto;
+    min-width: 12px;
     height: 1px;
     background: var(--line);
 }

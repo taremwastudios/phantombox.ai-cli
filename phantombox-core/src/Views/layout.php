@@ -10,17 +10,22 @@
  *   $viewFile   string  absolute path of the panel template to render
  *   $viewData   array   variables for that template
  *
+ * When $viewData['errorHeading'] is set the neutral error panel is rendered
+ * instead of an authentication panel.
+ *
  * Phantom Illusions Studio
  */
 
 declare(strict_types=1);
 
-if (!isset($pageTitle) || !isset($viewFile)) {
-    throw new RuntimeException('Layout requires $pageTitle and $viewFile.');
+if (!isset($pageTitle)) {
+    throw new RuntimeException('Layout requires $pageTitle.');
 }
 
 $viewData = $viewData ?? [];
 $csrfToken = (string) ($csrfToken ?? '');
+$errorHeading = $viewData['errorHeading'] ?? null;
+$errorBody = (string) ($viewData['errorBody'] ?? '');
 
 /** Minimal escape helper (views only ever output text or attribute values). */
 function h(?string $value): string
@@ -50,11 +55,24 @@ function h(?string $value): string
 
     <main class="auth-panel">
         <div class="auth-card">
-            <?php
-            // Panel template inherits the scope so it can use h() and $csrfToken.
-            extract($viewData, EXTR_SKIP);
-            require $viewFile;
-            ?>
+            <?php if ($errorHeading !== null): ?>
+                <header class="auth-heading">
+                    <span class="auth-kicker">PhantomBox Identity</span>
+                    <h1 class="auth-title"><?= h((string) $errorHeading) ?></h1>
+                </header>
+
+                <div class="alert alert-error" role="alert">
+                    <span><?= $errorBody /* fixed copy, escaped at source */ ?></span>
+                </div>
+
+                <p class="auth-footnote">No sign-in form is shown for this link.</p>
+            <?php else: ?>
+                <?php
+                // Panel template inherits the scope so it can use h() and $csrfToken.
+                extract($viewData, EXTR_SKIP);
+                require $viewFile;
+                ?>
+            <?php endif; ?>
         </div>
     </main>
 

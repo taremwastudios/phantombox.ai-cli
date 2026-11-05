@@ -29,8 +29,17 @@ class EmailAuthService
     }
 
     /**
-     * Request an OTP for an email. Always creates (or reuses) the user and
-     * returns true. The response never reveals whether the email exists.
+     * Request an OTP for an email.
+     *
+     * The account is resolved FIRST and the outcome is reported to the caller
+     * as `account_status`:
+     *
+     *   'existing'          - a fully registered account; a sign-in code is sent
+     *   'profile_required'  - a known account that has not completed its profile
+     *   'new'               - no account exists; NO code is sent, the caller must
+     *                         collect the profile details first
+     *
+     * A sign-in code is never issued for an address without an existing account.
      */
     public function requestCode(string $email): array
     {
@@ -40,7 +49,26 @@ class EmailAuthService
             return ['ok' => false, 'error' => 'A valid email address is required.'];
         }
 
-        $user = $this->identity->register($email);
+        // Account lookup happens in Core, before any OTP is generated.
+        $user = $this->identity->findByEmail($email);
+
+        if ($user === null) {
+            return [
+                'ok' => true,
+                'account_status' => 'new',
+                'profile_required' => true,
+                'message' => 'No account exists for this email address yet.',
+            ];
+        }
+
+        if (((int) ($user['profile_completed'] ?? 0)) !== 1) {
+            return [
+                'ok' => true,
+                'account_status' => 'profile_required',
+                'profile_required' => true,
+                'message' => 'This account still needs its profile details.',
+            ];
+        }
 
         // Invalidate previous outstanding codes for this user.
         $invalidate = $this->db->prepare(
@@ -65,8 +93,64 @@ class EmailAuthService
 
         return [
             'ok' => true,
+            'account_status' => 'existing',
+            'profile_required' => false,
             'message' => 'Verification code sent',
-            'profile_required' => ((int) $user['profile_completed']) !== 1,
+        ];
+    }
+
+    /**
+     * Register a new account and send its verification code.
+     *
+     * Used only for the new-account path, after the profile details have been
+     * collected. The account is created through the existing IdentityService
+     * and the code is issued by the same OTP machinery as a sign-in code.
+     */
+    public function registerAndRequestCode(
+        string $email,
+        string $firstName,
+        string $lastName,
+        string $phoneNumber
+    ): array {
+        $email = strtolower(trim($email));
+
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            return ['ok' => false, 'error' => 'A valid email address is required.'];
+        }
+
+        $firstName = trim($firstName);
+        $lastName = trim($lastName);
+        $phoneNumber = trim($phoneNumber);
+
+        if ($firstName === '' || mb_strlen($firstName) > 100) {
+            return ['ok' => false, 'error' => 'A valid first name is required.'];
+        }
+        if ($lastName === '' || mb_strlen($lastName) > 100) {
+            return ['ok' => false, 'error' => 'A valid last name is required.'];
+        }
+        if ($phoneNumber === '' || mb_strlen($phoneNumber) > 32
+            || preg_match('/^\+?[0-9][0-9\s().-]{5,30}$/', $phoneNumber) !== 1) {
+            return ['ok' => false, 'error' => 'A valid phone number with country code is required.'];
+        }
+
+        // An existing account must never be re-registered through this path.
+        if ($this->identity->findByEmail($email) !== null) {
+            return ['ok' => false, 'error' => 'An account already exists for this email address.'];
+        }
+
+        $user = $this->identity->register($email);
+        $this->identity->completeProfile((int) $user['id'], $firstName, $lastName, $phoneNumber);
+
+        $issued = $this->requestCode($email);
+        if (!($issued['ok'] ?? false)) {
+            return $issued;
+        }
+
+        return [
+            'ok' => true,
+            'account_status' => 'existing',
+            'profile_required' => false,
+            'message' => $issued['message'] ?? 'Verification code sent',
         ];
     }
 
