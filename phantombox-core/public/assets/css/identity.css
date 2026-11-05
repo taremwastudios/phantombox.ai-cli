@@ -1,0 +1,593 @@
+/* =====================================================================
+   PhantomBox Identity — authentication interface
+   Black & white identity · JetBrains Mono only · follows the system
+   light/dark preference (no manual toggle, no alternate palette).
+   Presentation only: no behaviour is defined in this file.
+   ===================================================================== */
+
+:root {
+    /* Light (default) */
+    --bg: #ffffff;
+    --bg-alt: #f5f5f5;
+    --fg: #0a0a0a;
+    --fg-muted: #555555;
+    --fg-dim: #8a8a8a;
+    --line: #e4e4e4;
+    --line-strong: #c8c8c8;
+    --surface: #ffffff;
+    --brand-bg: #0a0a0a;
+    --brand-fg: #ffffff;
+    --danger: #a1121f;
+    --danger-bg: #fdf1f2;
+    --ok: #0a6634;
+    --ok-bg: #f0f7f2;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #000000;
+        --bg-alt: #0c0c0c;
+        --fg: #f5f5f5;
+        --fg-muted: #a0a0a0;
+        --fg-dim: #6a6a6a;
+        --line: #222222;
+        --line-strong: #3a3a3a;
+        --surface: #0c0c0c;
+        --brand-bg: #f5f5f5;
+        --brand-fg: #000000;
+        --danger: #ff6b6b;
+        --danger-bg: #160b0c;
+        --ok: #6ee7a0;
+        --ok-bg: #0a140d;
+    }
+}
+
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+html {
+    -webkit-text-size-adjust: 100%;
+}
+
+body {
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--bg);
+    color: var(--fg);
+    font-size: 14px;
+    line-height: 1.6;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+.hidden {
+    display: none !important;
+}
+
+/* ---------------------------------------------------------------------
+   Two-panel shell — authentication left, branding right
+   --------------------------------------------------------------------- */
+.identity-shell {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 0.82fr);
+    min-height: 100vh;
+}
+
+.auth-panel {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 56px 32px;
+    border-right: 1px solid var(--line);
+}
+
+.brand-panel {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: 48px;
+    padding: 56px 40px;
+    background: var(--bg-alt);
+}
+
+/* ---------------------------------------------------------------------
+   Branding panel
+   --------------------------------------------------------------------- */
+.brand-figure {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 18px;
+    margin-top: 10vh;
+}
+
+.brand-banner {
+    width: 100%;
+    max-width: 330px;
+    height: auto;
+    display: none;
+}
+
+/* Exactly one banner variant is shown, chosen by the active theme. */
+@media (prefers-color-scheme: light) {
+    .brand-banner-light {
+        display: block;
+    }
+}
+
+@media (prefers-color-scheme: dark) {
+    .brand-banner-dark {
+        display: block;
+    }
+}
+
+.brand-tagline {
+    font-size: 11px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--fg-muted);
+}
+
+.info-block {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    border-top: 1px solid var(--line);
+    padding-top: 22px;
+}
+
+.info-title {
+    font-size: 10.5px;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: var(--fg-dim);
+}
+
+.info-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.info-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    color: var(--fg);
+    text-decoration: none;
+}
+
+.info-row img {
+    height: 24px;
+    width: auto;
+    display: block;
+}
+
+.info-row .info-label {
+    font-size: 12px;
+    color: var(--fg-muted);
+}
+
+.info-note {
+    font-size: 11px;
+    line-height: 1.75;
+    color: var(--fg-dim);
+}
+
+/* ---------------------------------------------------------------------
+   Authentication panel
+   --------------------------------------------------------------------- */
+.auth-card {
+    width: 100%;
+    max-width: 400px;
+    display: flex;
+    flex-direction: column;
+    gap: 26px;
+}
+
+.auth-heading {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.auth-kicker {
+    font-size: 10.5px;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: var(--fg-dim);
+}
+
+.auth-title {
+    font-size: 21px;
+    font-weight: 600;
+    letter-spacing: -.015em;
+}
+
+.auth-subtitle {
+    font-size: 12.5px;
+    color: var(--fg-muted);
+}
+
+/* Step progress */
+.steps {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 10.5px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--fg-dim);
+}
+
+.step-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+
+.step-caption { font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; }
+
+.step-dot {
+    width: 22px;
+    height: 22px;
+    border: 1px solid var(--line-strong);
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    flex: 0 0 auto;
+}
+
+.step-dot.active {
+    background: var(--brand-bg);
+    border-color: var(--brand-bg);
+    color: var(--brand-fg);
+}
+
+.step-dot.done {
+    border-color: var(--fg);
+    color: var(--fg);
+}
+
+.step-rule {
+    flex: 1 1 auto;
+    height: 1px;
+    background: var(--line);
+}
+
+/* Alerts — carry the server's real message verbatim */
+.alert {
+    border: 1px solid var(--line-strong);
+    padding: 11px 13px;
+    font-size: 12px;
+    line-height: 1.65;
+    overflow-wrap: anywhere;
+}
+
+.alert-error {
+    border-color: var(--danger);
+    background: var(--danger-bg);
+    color: var(--danger);
+}
+
+.alert-success {
+    border-color: var(--ok);
+    background: var(--ok-bg);
+    color: var(--ok);
+}
+
+/* Forms */
+.auth-form {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+}
+
+.form-group {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+}
+
+.form-label {
+    font-size: 11.5px;
+    color: var(--fg-muted);
+}
+
+.form-input {
+    font-family: inherit;
+    font-size: 14px;
+    color: var(--fg);
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+    border-radius: 0;
+    padding: 12px 13px;
+    width: 100%;
+    outline: none;
+    transition: border-color .15s ease;
+}
+
+.form-input::placeholder {
+    color: var(--fg-dim);
+}
+
+.form-input:focus {
+    border-color: var(--fg);
+}
+
+.form-hint {
+    font-size: 11px;
+    color: var(--fg-dim);
+}
+
+.form-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+}
+
+/* Buttons */
+.btn {
+    font-family: inherit;
+    font-size: 12.5px;
+    letter-spacing: .05em;
+    padding: 12px 16px;
+    border: 1px solid var(--brand-bg);
+    border-radius: 0;
+    background: var(--brand-bg);
+    color: var(--brand-fg);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    transition: opacity .15s ease;
+}
+
+.btn:hover:not(:disabled) {
+    opacity: .85;
+}
+
+.btn:disabled {
+    opacity: .45;
+    cursor: not-allowed;
+}
+
+.btn-block {
+    width: 100%;
+}
+
+.btn-ghost {
+    background: transparent;
+    color: var(--fg);
+    border-color: var(--line-strong);
+}
+
+.btn-ghost:hover:not(:disabled) {
+    border-color: var(--fg);
+    opacity: 1;
+}
+
+.btn-link {
+    font-family: inherit;
+    font-size: 11.5px;
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--fg-muted);
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+}
+
+.btn-link:hover:not(:disabled) {
+    color: var(--fg);
+}
+
+.btn-spinner {
+    width: 13px;
+    height: 13px;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    animation: spin .7s linear infinite;
+}
+
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+/* Email confirmation strip (step 2) */
+.email-confirm {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 13px;
+    border: 1px dashed var(--line-strong);
+    font-size: 11.5px;
+    color: var(--fg-muted);
+}
+
+.email-confirm .email-value {
+    color: var(--fg);
+    overflow-wrap: anywhere;
+}
+
+.resend-row {
+    text-align: center;
+}
+
+/* Restrained step transition */
+.step-view {
+    animation: stepIn .18s ease-out;
+}
+
+@keyframes stepIn {
+    from {
+        opacity: 0;
+        transform: translateY(4px);
+    }
+
+    to {
+        opacity: 1;
+        transform: none;
+    }
+}
+
+/* Device authorization summary */
+.device-summary {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 14px;
+    border: 1px solid var(--line);
+    font-size: 12px;
+}
+
+.device-summary .row {
+    display: flex;
+    justify-content: space-between;
+    gap: 14px;
+}
+
+.device-summary .k {
+    color: var(--fg-dim);
+    flex: 0 0 auto;
+}
+
+.device-summary .v {
+    text-align: right;
+    overflow-wrap: anywhere;
+}
+
+.device-actions {
+    display: flex;
+    gap: 12px;
+}
+
+.device-actions .btn {
+    flex: 1 1 0;
+}
+
+.completion-state {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 22px 16px;
+    border: 1px solid var(--line-strong);
+    text-align: center;
+}
+
+.completion-state.approved {
+    border-color: var(--ok);
+    background: var(--ok-bg);
+    color: var(--ok);
+}
+
+.completion-state.denied {
+    border-color: var(--danger);
+    background: var(--danger-bg);
+    color: var(--danger);
+}
+
+.completion-title {
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.completion-desc {
+    font-size: 12px;
+    color: var(--fg-muted);
+}
+
+.auth-footnote {
+    font-size: 10.5px;
+    color: var(--fg-dim);
+    border-top: 1px solid var(--line);
+    padding-top: 14px;
+}
+
+/* ---------------------------------------------------------------------
+   Tablet / mobile — stack the panels, authentication first
+   --------------------------------------------------------------------- */
+@media (max-width: 900px) {
+    .identity-shell {
+        grid-template-columns: 1fr;
+    }
+
+    .auth-panel {
+        order: 1;
+        border-right: none;
+        border-bottom: 1px solid var(--line);
+        padding: 44px 24px;
+    }
+
+    .brand-panel {
+        order: 2;
+        padding: 36px 24px;
+        gap: 28px;
+    }
+
+    .brand-figure {
+        margin-top: 0;
+        align-items: center;
+        text-align: center;
+    }
+
+    .brand-banner {
+        max-width: 250px;
+    }
+
+    .form-row {
+        grid-template-columns: 1fr;
+    }
+}
+
+@media (max-width: 460px) {
+    .auth-panel {
+        padding: 32px 16px;
+    }
+
+    .auth-title {
+        font-size: 18.5px;
+    }
+
+    .device-actions {
+        flex-direction: column;
+    }
+
+    .form-input,
+    .btn {
+        min-height: 44px;
+    }
+
+    /* comfortable touch targets */
+}
+
+/* Respect reduced-motion preferences */
+@media (prefers-reduced-motion: reduce) {
+    .step-view {
+        animation: none;
+    }
+
+    .btn,
+    .form-input {
+        transition: none;
+    }
+
+    .btn-spinner {
+        animation-duration: 1.6s;
+    }
+}

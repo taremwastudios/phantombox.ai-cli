@@ -1,0 +1,22 @@
+# PhantomBox Core - front controller rules
+# Serves existing files under public/ (CSS, JS, images) directly and routes
+# everything else through index.php.
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteBase /
+
+    # Existing files and directories are served as-is.
+    RewriteCond %{REQUEST_FILENAME} -f [OR]
+    RewriteCond %{REQUEST_FILENAME} -d
+    RewriteRule ^ - [L]
+
+    # Everything else is handled by the front controller.
+    RewriteRule ^ index.php [L]
+</IfModule>
+
+<IfModule mod_headers.c>
+    <FilesMatch "\.(css|js|png|jpg|jpeg|svg|webp|ico|woff2)$">
+        Header set Cache-Control "public, max-age=86400"
+    </FilesMatch>
+</IfModule>
